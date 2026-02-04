@@ -8,5 +8,5 @@ crons = ["*/15 * * * *"]
 
 [[kv_namespaces]]
 binding = "DB"
-id = "TODO_REPLACE_WITH_YOUR_KV_ID"
+id = "YOUTUBE_BOT_KV"
 preview_id = "TODO_REPLACE_WITH_YOUR_KV_PREVIEW_ID"

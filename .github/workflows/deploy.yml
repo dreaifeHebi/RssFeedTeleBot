@@ -2,14 +2,8 @@ name: Deploy to Cloudflare Workers
 
 on:
   push:
-    branches:
-      - main
-      - master
-  pull_request:
-    types: [closed]
-    branches:
-      - main
-      - master
+    tags:
+      - 'v*'  # 只有以 v 开头的 tag 才会触发（例如 v1.0.0）
 
 jobs:
   deploy:

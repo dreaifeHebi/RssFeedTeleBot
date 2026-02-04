@@ -29,7 +29,7 @@
 
 2.  **更新配置文件**:
     *   打开本仓库中的 `wrangler.toml` 文件。
-    *   将 `TODO_REPLACE_WITH_YOUR_KV_ID` 替换为你的实际 KV ID。
+    *   将 `YOUTUBE_BOT_KV` 替换为你的实际 KV ID。
     *   (可选) `preview_id` 可以保持原样，或者设置为相同的 ID 用于测试。
 
 ### 2. 部署

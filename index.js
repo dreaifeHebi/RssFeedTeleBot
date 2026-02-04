@@ -106,7 +106,16 @@ module.exports = {
           sentGuids = new Set(JSON.parse(storedData));
         }
 
-        const feed = await parser.parseURL(rssUrl);
+        // const feed = await parser.parseURL(rssUrl);
+        
+        // 1. 使用 Workers 原生的 fetch 获取数据
+        const response = await fetch(rssUrl);
+        const rssText = await response.text();
+
+        // 2. 只让 parser 解析文本
+        const feed = await parser.parseString(rssText);
+
+        console.log(feed.title);
         let newGuidsFound = false;
 
         if (feed.items && feed.items.length > 0) {

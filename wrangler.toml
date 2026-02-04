@@ -10,3 +10,7 @@ crons = ["*/15 * * * *"]
 binding = "DB"
 id = "5262d9a6b1ac41dfaf93f43e35ef6e29"
 preview_id = "TODO_REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+
+compatibility_flags = ["nodejs_compat"]
+
+compatibility_date = "2024-01-01" 

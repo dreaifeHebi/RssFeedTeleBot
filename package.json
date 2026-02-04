@@ -10,6 +10,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "rss-parser": "^3.13.0"
+    "fast-xml-parser": "^5.3.4"
   }
 }

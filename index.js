@@ -1,4 +1,4 @@
-const Parser = require('rss-parser');
+const { XMLParser } = require('fast-xml-parser');
 
 module.exports = {
   async fetch(request, env, ctx) {
@@ -77,7 +77,10 @@ module.exports = {
   },
 
   async scheduled(event, env, ctx) {
-    const parser = new Parser();
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "@_"
+    });
     const subs = await getSubscriptions(env);
 
     if (subs.length === 0) {
@@ -106,21 +109,53 @@ module.exports = {
           sentGuids = new Set(JSON.parse(storedData));
         }
 
-        // const feed = await parser.parseURL(rssUrl);
-        
-        // 1. 使用 Workers 原生的 fetch 获取数据
         const response = await fetch(rssUrl);
         const rssText = await response.text();
+        const feedRaw = parser.parse(rssText);
 
-        // 2. 只让 parser 解析文本
-        const feed = await parser.parseString(rssText);
+        let items = [];
+        let feedTitle = '';
 
-        console.log(feed.title);
+        if (feedRaw.feed && feedRaw.feed.entry) {
+          // Atom (YouTube)
+          feedTitle = feedRaw.feed.title;
+          const entries = Array.isArray(feedRaw.feed.entry) ? feedRaw.feed.entry : [feedRaw.feed.entry];
+          items = entries.map(entry => {
+             let link = '';
+             if (Array.isArray(entry.link)) {
+                const alt = entry.link.find(l => l['@_rel'] === 'alternate');
+                link = alt ? alt['@_href'] : entry.link[0]['@_href'];
+             } else if (entry.link && entry.link['@_href']) {
+                link = entry.link['@_href'];
+             } else {
+                link = entry.link;
+             }
+             
+             return {
+               title: entry.title,
+               link: link,
+               id: entry.id,
+               pubDate: entry.published || entry.updated
+             };
+          });
+        } else if (feedRaw.rss && feedRaw.rss.channel && feedRaw.rss.channel.item) {
+          // RSS 2.0
+          feedTitle = feedRaw.rss.channel.title;
+          const rssItems = Array.isArray(feedRaw.rss.channel.item) ? feedRaw.rss.channel.item : [feedRaw.rss.channel.item];
+          items = rssItems.map(item => ({
+            title: item.title,
+            link: item.link,
+            id: (item.guid && item.guid['#text']) ? item.guid['#text'] : (item.guid || item.link),
+            pubDate: item.pubDate
+          }));
+        }
+
+        console.log(feedTitle);
         let newGuidsFound = false;
 
-        if (feed.items && feed.items.length > 0) {
-          for (const item of feed.items) {
-            const guid = item.guid || item.id || item.link;
+        if (items.length > 0) {
+          for (const item of items) {
+            const guid = item.id || item.link;
 
             if (!sentGuids.has(guid)) {
               console.log(`New live found for ${channelName}: ${item.title}`);

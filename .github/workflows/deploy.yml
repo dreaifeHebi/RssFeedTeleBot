@@ -12,7 +12,7 @@ on:
 jobs:
   deploy:
     # if: github.event_name == 'push' || (github.event.pull_request.merged == true)
-    runs-on: ubuntu-latest
+    runs-on: selfN100
     name: Deploy
     steps:
       - uses: actions/checkout@v4
@@ -32,9 +32,11 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
+          wranglerVersion: '4.62.0'
           secrets: |
             TELEGRAM_BOT_TOKEN
             RSS_BASE_URL
         env:
+          WRANGLER_LOG: debug
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           RSS_BASE_URL: ${{ secrets.RSS_BASE_URL }}

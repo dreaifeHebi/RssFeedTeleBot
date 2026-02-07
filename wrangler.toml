@@ -8,5 +8,5 @@ crons = ["*/15 * * * *"]
 
 [[kv_namespaces]]
 binding = "DB"
-id = "5262d9a6b1ac41dfaf93f43e35ef6e29"
+id = "TODO_REPLACE_WITH_YOUR_KV_ID"
 preview_id = "TODO_REPLACE_WITH_YOUR_KV_PREVIEW_ID"

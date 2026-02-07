@@ -25,12 +25,12 @@ A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTub
 
 1.  **Create a KV Namespace**:
     *   Go to **Cloudflare Dashboard** > **Workers & Pages** > **KV**.
-    *   Create a namespace named `YOUTUBE_BOT_KV`.
+    *   Create a namespace named `RSS_BOT_KV`.
     *   Copy the **ID** of the namespace you just created.
 
 2.  **Update Configuration**:
     *   Open `wrangler.toml` in this repository.
-    *   Replace `YOUTUBE_BOT_KV` with your actual KV ID.
+    *   Replace `TODO_REPLACE_WITH_YOUR_KV_ID` with your actual KV ID.
     *   (Optional) You can leave `preview_id` as is or set it to the same ID for testing.
 
 ### 2. Deployment

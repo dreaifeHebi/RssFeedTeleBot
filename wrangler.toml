@@ -1,4 +1,4 @@
-name = "youtube-live-bot"
+name = "rss-feed-bot"
 main = "index.js"
 compatibility_date = "2024-02-04"
 compatibility_flags = ["nodejs_compat"]

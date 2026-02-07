@@ -53,12 +53,18 @@ export default {
       subsByUrl[sub.rssUrl].push(sub);
     }
 
+    const forwardConfigCache = new Map();
+
     for (const [rssUrl, subscribers] of Object.entries(subsByUrl)) {
       try {
         console.log(`Checking feed: ${rssUrl}`);
         
-        const channelName = subscribers[0].channelName;
-        const sentKey = `sent_guids:${channelName}`;
+        let hash = 0;
+        for (let i = 0; i < rssUrl.length; i++) {
+          hash = ((hash << 5) - hash) + rssUrl.charCodeAt(i);
+          hash |= 0;
+        }
+        const sentKey = `sent_guids:${hash}`;
         
         let sentGuids = new Set();
         const storedData = await env.DB.get(sentKey);
@@ -74,7 +80,6 @@ export default {
         let feedTitle = '';
 
         if (feedRaw.feed && feedRaw.feed.entry) {
-          // Atom (YouTube)
           feedTitle = feedRaw.feed.title;
           const entries = Array.isArray(feedRaw.feed.entry) ? feedRaw.feed.entry : [feedRaw.feed.entry];
           items = entries.map(entry => {
@@ -96,7 +101,6 @@ export default {
              };
           });
         } else if (feedRaw.rss && feedRaw.rss.channel && feedRaw.rss.channel.item) {
-          // RSS 2.0
           feedTitle = feedRaw.rss.channel.title;
           const rssItems = Array.isArray(feedRaw.rss.channel.item) ? feedRaw.rss.channel.item : [feedRaw.rss.channel.item];
           items = rssItems.map(item => ({
@@ -115,16 +119,32 @@ export default {
             const guid = item.id || item.link;
 
             if (!sentGuids.has(guid)) {
-              console.log(`New live found for ${channelName}: ${item.title}`);
+              const channelName = subscribers[0].channelName || feedTitle; 
+              console.log(`New item found for ${channelName}: ${item.title}`);
               
-              const message = `🔴 <b>YouTube Live Detected!</b>\n\n` +
+              const message = `🔴 <b>New Update!</b>\n\n` +
                 `<b>Title:</b> ${item.title}\n` +
-                `<b>Channel:</b> ${channelName}\n` +
+                `<b>Source:</b> ${channelName}\n` +
                 `<b>Link:</b> ${item.link}\n` +
                 `<b>Date:</b> ${item.pubDate}`;
 
               for (const sub of subscribers) {
-                await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, sub.chatId, sub.threadId, message);
+                let config = forwardConfigCache.get(sub.chatId);
+                if (config === undefined) {
+                   const rawConfig = await env.DB.get(`forward_config:${sub.chatId}`);
+                   config = rawConfig ? JSON.parse(rawConfig) : null;
+                   forwardConfigCache.set(sub.chatId, config);
+                }
+
+                if (config) {
+                   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, config.targetChatId, null, message);
+                   
+                   if (!config.onlyForward) {
+                     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, sub.chatId, sub.threadId, message);
+                   }
+                } else {
+                   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, sub.chatId, sub.threadId, message);
+                }
               }
 
               sentGuids.add(guid);
@@ -151,29 +171,34 @@ async function handleMessage(message, env) {
   const text = message.text.trim();
 
   if (text.startsWith('/start')) {
-    const welcomeMsg = `👋 <b>YouTube Live Monitor Bot</b>\n\n` +
-      `I can help you monitor YouTube channels and notify you when they go live.\n\n` +
+    const welcomeMsg = `👋 <b>RSS & Social Monitor Bot</b>\n\n` +
+      `I can monitor RSS feeds, X (Twitter), and YouTube channels for you.\n\n` +
       `<b>Commands:</b>\n` +
-      `/add &lt;channel_name&gt; - Add a subscription\n` +
-      `/del &lt;channel_name&gt; - Remove a subscription\n` +
+      `/add rss &lt;url&gt; - Add RSS feed\n` +
+      `/add x &lt;username&gt; - Add X user\n` +
+      `/del &lt;name&gt; - Remove subscription\n` +
       `/list - List subscriptions\n` +
-      `/forward_to &lt;target_chat_id&gt; [thread_id] - Forward subscriptions to another chat\n` +
-      `/id - Get current Chat ID and Thread ID\n` +
-      `/help - Show this help message`;
+      `/set_forward - Configure forwarding\n` +
+      `/help - Show help`;
     
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, welcomeMsg);
   }
   else if (text.startsWith('/help')) {
     const helpMsg = `📖 <b>Help Guide</b>\n\n` +
       `<b>1. Add Subscription</b>\n` +
-      `Use <code>/add channel_name</code> to subscribe. The channel name is usually the part after @ in the URL (e.g., for @PewDiePie, use PewDiePie).\n\n` +
-      `<b>2. Forwarding Subscriptions</b>\n` +
-      `To forward notifications to another channel/group:\n` +
-      `1. Add the bot to the destination channel/group.\n` +
-      `2. Send <code>/id</code> in the destination to get the Chat ID.\n` +
-      `3. Go to the source group where subscriptions are.\n` +
-      `4. Send <code>/forward_to &lt;destination_chat_id&gt;</code>.\n` +
-      `5. Select channels to forward.`;
+      `Use <code>/add &lt;type&gt; &lt;arg&gt;</code>\n` +
+      `- RSS: <code>/add rss https://example.com/feed.xml</code>\n` +
+      `- X (Twitter): <code>/add x username</code>\n` +
+      `- YouTube: <code>/add youtube ChannelID</code>\n\n` +
+      `<b>2. Forwarding Settings</b>\n` +
+      `Configure message forwarding to another channel/group:\n` +
+      `<code>/set_forward &lt;target_chat_id&gt; [only_forward: true/false]</code>\n` +
+      `Example: <code>/set_forward -100123456789 true</code> (Sends ONLY to target)\n` +
+      `To remove: <code>/del_forward</code>\n\n` +
+      `<b>3. Manage Subscriptions</b>\n` +
+      `- List: <code>/list</code>\n` +
+      `- Remove: <code>/del &lt;name&gt;</code>\n` +
+      `- ID Info: <code>/id</code>`;
       
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, helpMsg);
   }
@@ -189,25 +214,80 @@ async function handleMessage(message, env) {
   }
   else if (text.startsWith('/add')) {
     const parts = text.split(/\s+/);
-    if (parts.length < 2) {
-       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Usage: /add <channel_name>');
+    if (parts.length < 3) {
+       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 
+         'Usage:\n' +
+         '/add rss <url>\n' +
+         '/add x <username>\n' +
+         '/add youtube <channel_name>'
+       );
        return new Response('OK');
     }
     
-    const channelName = parts[1];
-    const rssUrl = (env.RSS_BASE_URL || 'https://rss.dreaife.tokyo/youtube/live/') + channelName;
+    const type = parts[1].toLowerCase();
+    const arg = parts[2];
+    
+    let channelName = arg;
+    let rssUrl = '';
+
+    if (type === 'rss') {
+      rssUrl = arg;
+      try {
+        const urlObj = new URL(rssUrl);
+        channelName = urlObj.hostname + (urlObj.pathname.length > 1 ? urlObj.pathname : '');
+      } catch (e) {
+        channelName = rssUrl;
+      }
+    } else if (type === 'x') {
+      rssUrl = `https://rss.dreaife.tokyo/twitter/user/${arg}`;
+      channelName = arg;
+    } else if (type === 'youtube') {
+      rssUrl = (env.RSS_BASE_URL || 'https://rss.dreaife.tokyo/youtube/live/') + arg;
+      channelName = arg;
+    } else {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Unknown type. Use rss, x, or youtube.');
+      return new Response('OK');
+    }
     
     const subs = await getSubscriptions(env);
-    const exists = subs.some(s => s.channelName === channelName && s.chatId === chatId && s.threadId === threadId);
+    const exists = subs.some(s => s.rssUrl === rssUrl && s.chatId === chatId && s.threadId === threadId);
     
     if (!exists) {
-      subs.push({ channelName, rssUrl, chatId, threadId });
+      subs.push({ type, channelName, rssUrl, chatId, threadId });
       await env.DB.put('subscriptions', JSON.stringify(subs));
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `✅ Added ${channelName} to watchlist.`);
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `✅ Added ${type} subscription: ${channelName}`);
     } else {
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `⚠️ ${channelName} is already in the watchlist.`);
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `⚠️ Subscription already exists.`);
     }
   } 
+  else if (text.startsWith('/set_forward')) {
+    const parts = text.split(/\s+/);
+    if (parts.length < 2) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 
+        'Usage: /set_forward <target_chat_id> [only_forward: true/false]\n' +
+        'Example: /set_forward -100123456789 true'
+      );
+      return new Response('OK');
+    }
+
+    const targetChatId = parseInt(parts[1]);
+    const onlyForward = parts.length > 2 ? parts[2].toLowerCase() === 'true' : false;
+    
+    if (isNaN(targetChatId)) {
+      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, '⚠️ Invalid Target Chat ID.');
+      return new Response('OK');
+    }
+
+    const config = { targetChatId, onlyForward };
+    await env.DB.put(`forward_config:${chatId}`, JSON.stringify(config));
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 
+      `✅ Forwarding configured.\nTarget: ${targetChatId}\nOnly Forward: ${onlyForward}`
+    );
+  }
+  else if (text.startsWith('/del_forward')) {
+    await env.DB.delete(`forward_config:${chatId}`);
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, '✅ Forwarding configuration removed.');
+  }
   else if (text.startsWith('/del') || text.startsWith('/remove')) {
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
@@ -268,7 +348,6 @@ async function handleMessage(message, env) {
       return new Response('OK');
     }
 
-    // Use global crypto or fallback
     const uuid = globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
     const sessionId = uuid;
     
@@ -277,11 +356,9 @@ async function handleMessage(message, env) {
       targetThreadId,
       sourceChatId: chatId,
       sourceThreadId: threadId,
-      // Map index to channel name to keep callback data short for Telegram limits
       channelMap: currentSubs.map(s => s.channelName)
     };
     
-    // Store session in KV with 1 hour expiration
     await env.DB.put(`fwd_session:${sessionId}`, JSON.stringify(sessionData), { expirationTtl: 3600 });
 
     const keyboard = {
@@ -317,7 +394,6 @@ async function handleCallback(callbackQuery, env) {
 
   const parts = data.split(':');
   if (parts.length < 3) {
-    // Malformed callback data
     await answerCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackQuery.id, "❌ Invalid callback data.");
     return new Response('OK');
   }
@@ -333,7 +409,6 @@ async function handleCallback(callbackQuery, env) {
 
   const session = JSON.parse(sessionRaw);
   
-  // Validate source chat to prevent cross-chat replay attacks
   if (session.sourceChatId !== chatId) {
     await answerCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackQuery.id, "❌ This button is not for this chat.");
     return new Response('OK');
@@ -376,7 +451,6 @@ async function handleCallback(callbackQuery, env) {
     
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, session.sourceThreadId, `✅ Successfully forwarded ${addedCount} subscriptions to target.`);
     
-    // Delete session to prevent replay
     await env.DB.delete(`fwd_session:${sessionId}`);
   } else {
     await answerCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackQuery.id, "⚠️ Channels already exist in target.");

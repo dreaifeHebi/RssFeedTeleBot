@@ -62,7 +62,7 @@ npx wrangler deploy
 2.  进入 **Settings** > **Variables and Secrets**。
 3.  添加以下密钥 (Secret):
     *   `TELEGRAM_BOT_TOKEN`: 你的 Telegram Bot Token。
-    *   (可选) `RSS_BASE_URL`: 默认为 `https://rsshub.app/youtube/user/`。
+    *   (可选) `RSS_BASE_URL`: 默认为 `https://rsshub.app`。
 
 ### 4. 设置 Webhook (关键步骤!)
 
@@ -95,12 +95,19 @@ curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=<YOUR_WORKER_U
 *   **移除订阅**:
     ```text
     /del <name>
+    /del <type> <name>
     ```
+    *示例:*
+    *   `/del elonmusk`（删除当前 chat/thread 下同名订阅）
+    *   `/del x elonmusk`（仅删除 X 订阅）
+    *   `/del youtube elonmusk`（仅删除 YouTube 订阅）
+    *`<type>` 支持 `rss`、`x`、`youtube`。*
 
 *   **列出订阅**:
     ```text
     /list
     ```
+    *输出格式:* `- [type] channel_name`（例如 `- [x] elonmusk`）
 
 *   **转发设置**:
     配置将消息转发到另一个频道/群组。

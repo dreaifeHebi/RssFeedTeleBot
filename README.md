@@ -62,7 +62,7 @@ After deployment, configure the secrets in Cloudflare:
 2.  Go to **Settings** > **Variables and Secrets**.
 3.  Add the following secrets:
     *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
-    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rsshub.app/youtube/user/`.
+    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rsshub.app`.
 
 ### 4. Setup Webhook (Crucial!)
 
@@ -95,12 +95,19 @@ Add the bot to your Group or Supergroup.
 *   **Remove Subscription**:
     ```text
     /del <name>
+    /del <type> <name>
     ```
+    *Example:*
+    *   `/del elonmusk` (remove all subscriptions named `elonmusk` in current chat/thread)
+    *   `/del x elonmusk` (remove only X subscription)
+    *   `/del youtube elonmusk` (remove only YouTube subscription)
+    *`<type>` supports `rss`, `x`, `youtube`.*
 
 *   **List Subscriptions**:
     ```text
     /list
     ```
+    *Output format:* `- [type] channel_name` (e.g. `- [x] elonmusk`)
 
 *   **Forwarding Settings**:
     Configure message forwarding to another channel/group.

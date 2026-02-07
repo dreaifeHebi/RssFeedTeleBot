@@ -176,7 +176,7 @@ async function handleMessage(message, env) {
       `<b>Commands:</b>\n` +
       `/add rss &lt;url&gt; - Add RSS feed\n` +
       `/add x &lt;username&gt; - Add X user\n` +
-      `/del &lt;name&gt; - Remove subscription\n` +
+      `/del [type] &lt;name&gt; - Remove subscription\n` +
       `/list - List subscriptions\n` +
       `/set_forward - Configure forwarding\n` +
       `/help - Show help`;
@@ -197,7 +197,7 @@ async function handleMessage(message, env) {
       `To remove: <code>/del_forward</code>\n\n` +
       `<b>3. Manage Subscriptions</b>\n` +
       `- List: <code>/list</code>\n` +
-      `- Remove: <code>/del &lt;name&gt;</code>\n` +
+      `- Remove: <code>/del [type] &lt;name&gt;</code>\n` +
       `- ID Info: <code>/id</code>`;
       
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, helpMsg);
@@ -239,10 +239,10 @@ async function handleMessage(message, env) {
         channelName = rssUrl;
       }
     } else if (type === 'x') {
-      rssUrl = `https://rsshub.app/twitter/user/${arg}`;
+      rssUrl = `${env.RSS_BASE_URL || 'https://rsshub.app'}/twitter/user/${arg}`;
       channelName = arg;
     } else if (type === 'youtube') {
-      rssUrl = (env.RSS_BASE_URL || 'https://rsshub.app') + '/youtube/user/' + arg;
+      rssUrl = `${env.RSS_BASE_URL || 'https://rsshub.app'}/youtube/user/${arg}`;
       channelName = arg;
     } else {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Unknown type. Use rss, x, or youtube.');
@@ -291,19 +291,53 @@ async function handleMessage(message, env) {
   else if (text.startsWith('/del') || text.startsWith('/remove')) {
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
-       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Usage: /del <channel_name>');
+       await sendTelegramMessage(
+         env.TELEGRAM_BOT_TOKEN,
+         chatId,
+         threadId,
+         'Usage: /del <channel_name>\n' +
+         'Or: /del <type> <channel_name> (type: rss, x, youtube)'
+       );
        return new Response('OK');
     }
-    
-    const channelName = parts[1];
+
+    let type = null;
+    let channelName = parts[1];
+    if (parts.length >= 3) {
+      const maybeType = parts[1].toLowerCase();
+      if (maybeType === 'rss' || maybeType === 'x' || maybeType === 'youtube') {
+        type = maybeType;
+        channelName = parts[2];
+      }
+    }
+
     let subs = await getSubscriptions(env);
-    const newSubs = subs.filter(s => !(s.channelName === channelName && s.chatId === chatId && s.threadId === threadId));
+    const newSubs = subs.filter((s) => {
+      if (s.chatId !== chatId || s.threadId !== threadId) {
+        return true;
+      }
+      if (s.channelName !== channelName) {
+        return true;
+      }
+      const effectiveType = s.type || inferTypeFromRssUrl(s.rssUrl);
+      return type ? effectiveType !== type : false;
+    });
     
     if (subs.length !== newSubs.length) {
       await env.DB.put('subscriptions', JSON.stringify(newSubs));
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `🗑️ Removed ${channelName} from watchlist.`);
+      await sendTelegramMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        threadId,
+        `🗑️ Removed ${type ? `${type} ` : ''}${channelName} from watchlist.`
+      );
     } else {
-       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `⚠️ Subscription for ${channelName} not found.`);
+       await sendTelegramMessage(
+         env.TELEGRAM_BOT_TOKEN,
+         chatId,
+         threadId,
+         `⚠️ Subscription for ${type ? `${type} ` : ''}${channelName} not found.`
+       );
     }
   }
   else if (text.startsWith('/list')) {
@@ -313,7 +347,12 @@ async function handleMessage(message, env) {
     if (mySubs.length === 0) {
        await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, '📭 No active subscriptions.');
     } else {
-       const list = mySubs.map(s => `- ${s.channelName}`).join('\n');
+       const list = mySubs
+         .map((s) => {
+           const type = s.type || inferTypeFromRssUrl(s.rssUrl);
+           return `- [${type}] ${s.channelName}`;
+         })
+         .join('\n');
        await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `📋 <b>Subscriptions:</b>\n${list}`);
     }
   }
@@ -356,7 +395,11 @@ async function handleMessage(message, env) {
       targetThreadId,
       sourceChatId: chatId,
       sourceThreadId: threadId,
-      channelMap: currentSubs.map(s => s.channelName)
+      subMap: currentSubs.map((s) => ({
+        type: s.type || inferTypeFromRssUrl(s.rssUrl),
+        channelName: s.channelName,
+        rssUrl: s.rssUrl
+      }))
     };
     
     await env.DB.put(`fwd_session:${sessionId}`, JSON.stringify(sessionData), { expirationTtl: 3600 });
@@ -365,7 +408,7 @@ async function handleMessage(message, env) {
       inline_keyboard: [
         [{ text: "🚀 Forward All", callback_data: `fwd:${sessionId}:ALL` }],
         ...currentSubs.map((s, idx) => [{ 
-          text: `📺 ${s.channelName}`, 
+          text: `📺 [${s.type || inferTypeFromRssUrl(s.rssUrl)}] ${s.channelName}`, 
           callback_data: `fwd:${sessionId}:${idx}` 
         }])
       ]
@@ -414,19 +457,19 @@ async function handleCallback(callbackQuery, env) {
     return new Response('OK');
   }
 
-  const { targetChatId, targetThreadId, channelMap } = session;
+  const { targetChatId, targetThreadId, subMap } = session;
 
-  let channelsToForward = [];
+  let subsToForward = [];
   if (action === 'ALL') {
-    channelsToForward = channelMap;
+    subsToForward = subMap || [];
   } else {
     const idx = parseInt(action);
-    if (channelMap[idx]) {
-      channelsToForward = [channelMap[idx]];
+    if ((subMap || [])[idx]) {
+      subsToForward = [subMap[idx]];
     }
   }
 
-  if (channelsToForward.length === 0) {
+  if (subsToForward.length === 0) {
     await answerCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackQuery.id, "⚠️ No channel selected.");
     return new Response('OK');
   }
@@ -434,13 +477,14 @@ async function handleCallback(callbackQuery, env) {
   const subs = await getSubscriptions(env);
   let addedCount = 0;
 
-  for (const channelName of channelsToForward) {
-    const rssUrl = (env.RSS_BASE_URL || 'https://rss.dreaife.tokyo') + '/youtube/user/' + channelName;
-    
-    const exists = subs.some(s => s.channelName === channelName && s.chatId === targetChatId && s.threadId === targetThreadId);
+  for (const subToForward of subsToForward) {
+    const { type, channelName, rssUrl } = subToForward;
+    const exists = subs.some(
+      (s) => s.rssUrl === rssUrl && s.chatId === targetChatId && s.threadId === targetThreadId
+    );
     
     if (!exists) {
-      subs.push({ channelName, rssUrl, chatId: targetChatId, threadId: targetThreadId });
+      subs.push({ type, channelName, rssUrl, chatId: targetChatId, threadId: targetThreadId });
       addedCount++;
     }
   }
@@ -462,6 +506,16 @@ async function handleCallback(callbackQuery, env) {
 async function getSubscriptions(env) {
   const data = await env.DB.get('subscriptions');
   return data ? JSON.parse(data) : [];
+}
+
+function inferTypeFromRssUrl(rssUrl = '') {
+  if (rssUrl.includes('/twitter/user/')) {
+    return 'x';
+  }
+  if (rssUrl.includes('/youtube/user/')) {
+    return 'youtube';
+  }
+  return 'rss';
 }
 
 async function sendTelegramMessage(token, chatId, threadId, text, replyMarkup = null) {

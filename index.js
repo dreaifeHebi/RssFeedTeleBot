@@ -239,10 +239,10 @@ async function handleMessage(message, env) {
         channelName = rssUrl;
       }
     } else if (type === 'x') {
-      rssUrl = `${env.RSS_BASE_URL || 'https://rsshub.app'}/twitter/user/${arg}`;
+      rssUrl = buildRssHubUrl(env, `/twitter/user/${arg}`);
       channelName = arg;
     } else if (type === 'youtube') {
-      rssUrl = `${env.RSS_BASE_URL || 'https://rsshub.app'}/youtube/user/${arg}`;
+      rssUrl = buildRssHubUrl(env, `/youtube/user/${arg}`);
       channelName = arg;
     } else {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Unknown type. Use rss, x, or youtube.');
@@ -509,13 +509,66 @@ async function getSubscriptions(env) {
 }
 
 function inferTypeFromRssUrl(rssUrl = '') {
-  if (rssUrl.includes('/twitter/user/')) {
+  const route = extractPathname(rssUrl);
+  if (route.includes('/twitter/') || route.includes('/x/')) {
     return 'x';
   }
-  if (rssUrl.includes('/youtube/user/')) {
+  if (route.includes('/youtube/')) {
     return 'youtube';
   }
   return 'rss';
+}
+
+function buildRssHubUrl(env, route) {
+  const baseUrl = normalizeRssBaseUrl(env.RSS_BASE_URL);
+  const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
+  return `${baseUrl}${normalizedRoute}`;
+}
+
+function normalizeRssBaseUrl(rawBaseUrl = '') {
+  const fallback = 'https://rsshub.app';
+  const trimmed = String(rawBaseUrl || '').trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  try {
+    const url = new URL(withProtocol);
+    let path = url.pathname.replace(/\/+$/, '');
+
+    // Backward compatibility for legacy values like ".../youtube/user" or ".../twitter/user".
+    const legacySuffixes = [
+      '/youtube/user',
+      '/youtube/channel',
+      '/youtube/live',
+      '/twitter/user',
+      '/x/user'
+    ];
+    for (const suffix of legacySuffixes) {
+      if (path.toLowerCase().endsWith(suffix)) {
+        path = path.slice(0, -suffix.length);
+        break;
+      }
+    }
+
+    return `${url.origin}${path && path !== '/' ? path : ''}`;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function extractPathname(urlOrPath = '') {
+  const value = String(urlOrPath || '').trim().toLowerCase();
+  if (!value) {
+    return '';
+  }
+  try {
+    return new URL(value).pathname.toLowerCase();
+  } catch (e) {
+    return value;
+  }
 }
 
 async function sendTelegramMessage(token, chatId, threadId, text, replyMarkup = null) {

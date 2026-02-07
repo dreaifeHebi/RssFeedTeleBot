@@ -44,7 +44,7 @@ A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTub
     *   `CLOUDFLARE_ACCOUNT_ID`: Found on the right sidebar of your Workers dashboard.
     *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
     *   `KV_ID`: The ID of your `RSS_BOT_KV` namespace.
-    *   `RSS_BASE_URL`: (Optional) Custom RSS base URL (defaults to `https://rsshub.app`).
+    *   `RSS_BASE_URL`: (Optional) Custom RSSHub base URL (defaults to `https://rsshub.app`). Supports host-only or base path (e.g. `https://rsshub.app` or `https://your-rsshub.example.com/proxy`). Legacy full-route values (like `/youtube/user`) are auto-normalized.
 4.  Push to the `main` branch. The Action will automatically deploy your worker.
 
 #### Option B: Manual Deployment
@@ -62,7 +62,7 @@ After deployment, configure the secrets in Cloudflare:
 2.  Go to **Settings** > **Variables and Secrets**.
 3.  Add the following secrets:
     *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
-    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rsshub.app`.
+    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rsshub.app`. Supports host-only or base path. Legacy full-route values (like `/youtube/user`) are auto-normalized.
 
 ### 4. Setup Webhook (Crucial!)
 

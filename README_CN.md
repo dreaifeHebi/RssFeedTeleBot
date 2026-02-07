@@ -44,7 +44,7 @@
     *   `CLOUDFLARE_ACCOUNT_ID`: 在 Workers 面板的右侧边栏可以找到。
     *   `TELEGRAM_BOT_TOKEN`: 你的 Telegram Bot Token。
     *   `KV_ID`: 你的 `RSS_BOT_KV` 命名空间 ID。
-    *   `RSS_BASE_URL`: (可选) 自定义的 RSS Base URL (默认为 `https://rsshub.app`)。
+    *   `RSS_BASE_URL`: (可选) 自定义 RSSHub 基础地址 (默认为 `https://rsshub.app`)。支持仅主机或带基础路径（例如 `https://rsshub.app` 或 `https://your-rsshub.example.com/proxy`）。旧的完整路由配置（如 `/youtube/user`）会自动规范化。
 4.  推送到 `main` 分支。Action 将会自动部署你的 Worker。
 
 #### 方案 B: 手动部署
@@ -62,7 +62,7 @@ npx wrangler deploy
 2.  进入 **Settings** > **Variables and Secrets**。
 3.  添加以下密钥 (Secret):
     *   `TELEGRAM_BOT_TOKEN`: 你的 Telegram Bot Token。
-    *   (可选) `RSS_BASE_URL`: 默认为 `https://rsshub.app`。
+    *   (可选) `RSS_BASE_URL`: 默认为 `https://rsshub.app`。支持仅主机或基础路径，旧的完整路由配置（如 `/youtube/user`）会自动规范化。
 
 ### 4. 设置 Webhook (关键步骤!)
 

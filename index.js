@@ -242,7 +242,7 @@ async function handleMessage(message, env) {
       rssUrl = `https://rsshub.app/twitter/user/${arg}`;
       channelName = arg;
     } else if (type === 'youtube') {
-      rssUrl = (env.RSS_BASE_URL || 'https://rsshub.app/youtube/user/') + arg;
+      rssUrl = (env.RSS_BASE_URL || 'https://rsshub.app') + '/youtube/user/' + arg;
       channelName = arg;
     } else {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Unknown type. Use rss, x, or youtube.');
@@ -435,7 +435,7 @@ async function handleCallback(callbackQuery, env) {
   let addedCount = 0;
 
   for (const channelName of channelsToForward) {
-    const rssUrl = (env.RSS_BASE_URL || 'https://rss.dreaife.tokyo/youtube/live/') + channelName;
+    const rssUrl = (env.RSS_BASE_URL || 'https://rss.dreaife.tokyo') + '/youtube/user/' + channelName;
     
     const exists = subs.some(s => s.channelName === channelName && s.chatId === targetChatId && s.threadId === targetThreadId);
     

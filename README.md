@@ -44,7 +44,7 @@ A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTub
     *   `CLOUDFLARE_ACCOUNT_ID`: Found on the right sidebar of your Workers dashboard.
     *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
     *   `KV_ID`: The ID of your `RSS_BOT_KV` namespace.
-    *   `RSS_BASE_URL`: (Optional) Custom RSS base URL (defaults to `https://rsshub.app/youtube/user/`).
+    *   `RSS_BASE_URL`: (Optional) Custom RSS base URL (defaults to `https://rsshub.app`).
 4.  Push to the `main` branch. The Action will automatically deploy your worker.
 
 #### Option B: Manual Deployment

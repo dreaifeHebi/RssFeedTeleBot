@@ -44,7 +44,7 @@
     *   `CLOUDFLARE_ACCOUNT_ID`: 在 Workers 面板的右侧边栏可以找到。
     *   `TELEGRAM_BOT_TOKEN`: 你的 Telegram Bot Token。
     *   `KV_ID`: 你的 `RSS_BOT_KV` 命名空间 ID。
-    *   `RSS_BASE_URL`: (可选) 自定义的 RSS Base URL (默认为 `https://rsshub.app/youtube/user/`)。
+    *   `RSS_BASE_URL`: (可选) 自定义的 RSS Base URL (默认为 `https://rsshub.app`)。
 4.  推送到 `main` 分支。Action 将会自动部署你的 Worker。
 
 #### 方案 B: 手动部署

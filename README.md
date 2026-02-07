@@ -1,15 +1,16 @@
-# YouTube Live Telegram Bot (Cloudflare Workers Edition)
+# RSS Feed Telegram Bot (Cloudflare Workers Edition)
 
 [中文文档](README_CN.md) | English
 
-A serverless Telegram bot that monitors YouTube channels for live streams and sends notifications to Telegram chats, supergroups, and topics. Run entirely on Cloudflare Workers (Free Tier compatible).
+A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTube channels (via RSSHub) and sends notifications to Telegram chats, supergroups, and topics. Run entirely on Cloudflare Workers (Free Tier compatible).
 
 ## Features
 
 - **Serverless**: Runs on Cloudflare Workers (no VPS required).
-- **Interactive Management**: Add/remove channels directly from Telegram.
+- **Interactive Management**: Add/remove subscriptions directly from Telegram.
 - **Topic Support**: Fully supports Telegram Supergroup Topics (Threads).
-- **Multi-Subscription**: Monitor multiple YouTube channels.
+- **Multi-Subscription**: Monitor multiple feeds.
+- **Selective Forwarding**: Forward notifications to another chat, with option to mute source.
 - **Cost Efficient**: Uses Cloudflare KV for state and Cron Triggers for scheduling.
 
 ## Prerequisites
@@ -42,7 +43,7 @@ A serverless Telegram bot that monitors YouTube channels for live streams and se
     *   `CLOUDFLARE_API_TOKEN`: Create via [User Profile > API Tokens](https://dash.cloudflare.com/profile/api-tokens) (Template: *Edit Cloudflare Workers*).
     *   `CLOUDFLARE_ACCOUNT_ID`: Found on the right sidebar of your Workers dashboard.
     *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
-    *   `RSS_BASE_URL`: (Optional) Custom RSS base URL (if needed).
+    *   `RSS_BASE_URL`: (Optional) Custom RSS base URL (defaults to `https://rsshub.app/youtube/user/`).
 4.  Push to the `main` branch. The Action will automatically deploy your worker.
 
 #### Option B: Manual Deployment
@@ -56,17 +57,17 @@ npx wrangler deploy
 
 After deployment, configure the secrets in Cloudflare:
 
-1.  Go to **Cloudflare Dashboard** > **Workers & Pages** > **Overview** > Select `youtube-live-bot`.
+1.  Go to **Cloudflare Dashboard** > **Workers & Pages** > **Overview** > Select `rss-feed-bot`.
 2.  Go to **Settings** > **Variables and Secrets**.
 3.  Add the following secrets:
-    *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token (e.g., `123456:ABC-DEF...`).
-    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rss.dreaife.tokyo/youtube/live/`.
+    *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
+    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rsshub.app/youtube/user/`.
 
 ### 4. Setup Webhook (Crucial!)
 
 For the bot to reply to commands, you must tell Telegram where your Worker is located.
 
-1.  Find your Worker URL (e.g., `https://youtube-live-bot.your-subdomain.workers.dev`).
+1.  Find your Worker URL (e.g., `https://rss-feed-bot.your-subdomain.workers.dev`).
 2.  Run this command in your browser or terminal:
 
 ```bash
@@ -81,14 +82,18 @@ Add the bot to your Group or Supergroup.
 
 *   **Add Subscription**:
     ```text
-    /add <channel_id_or_name>
+    /add rss <url>
+    /add x <username>
+    /add youtube <username>
     ```
-    *Example: `/add weathernews`*
-    *If sent in a specific Topic, notifications will be sent to that Topic.*
+    *Example:*
+    *   `/add rss https://example.com/feed.xml`
+    *   `/add x elonmusk`
+    *   `/add youtube PewDiePie`
 
 *   **Remove Subscription**:
     ```text
-    /del <channel_id_or_name>
+    /del <name>
     ```
 
 *   **List Subscriptions**:
@@ -96,16 +101,23 @@ Add the bot to your Group or Supergroup.
     /list
     ```
 
-*   **Forward Subscriptions**:
-    Allows copying subscriptions from the current chat to another chat (Group/Channel).
+*   **Forwarding Settings**:
+    Configure message forwarding to another channel/group.
+    ```text
+    /set_forward <target_chat_id> [only_forward: true/false]
+    ```
+    *Example: `/set_forward -100123456789 true` (Sends ONLY to target)*
     
-    1.  Add the bot to the **Target** chat/channel.
-    2.  Send `/id` in the **Target** chat to get the `Chat ID`.
-    3.  In the **Source** chat, send:
-        ```text
-        /forward_to <target_chat_id> [target_thread_id]
-        ```
-    4.  Select **"Forward All"** or specific channels from the interactive buttons.
+    To remove:
+    ```text
+    /del_forward
+    ```
+
+*   **Forward Subscriptions (Bulk Copy)**:
+    Allows copying subscriptions from the current chat to another chat.
+    ```text
+    /forward_to <target_chat_id> [target_thread_id]
+    ```
 
 *   **Get Chat Info**:
     ```text
@@ -121,7 +133,7 @@ Add the bot to your Group or Supergroup.
 ## How it Works
 
 1.  **Interactive**: When you send a command, Telegram pushes the update to the Worker (Webhook), which updates the subscription list in KV.
-2.  **Scheduled**: Every 15 minutes (configurable in `wrangler.toml`), the Worker wakes up, checks RSS feeds for all subscriptions, and sends alerts for new streams.
+2.  **Scheduled**: Every 15 minutes (configurable in `wrangler.toml`), the Worker wakes up, checks RSS feeds for all subscriptions, and sends alerts for new updates.
 
 ## License
 

@@ -189,7 +189,7 @@ async function handleMessage(message, env) {
       `Use <code>/add &lt;type&gt; &lt;arg&gt;</code>\n` +
       `- RSS: <code>/add rss https://example.com/feed.xml</code>\n` +
       `- X (Twitter): <code>/add x username</code>\n` +
-      `- YouTube: <code>/add youtube ChannelID</code>\n\n` +
+      `- YouTube: <code>/add youtube username</code>\n\n` +
       `<b>2. Forwarding Settings</b>\n` +
       `Configure message forwarding to another channel/group:\n` +
       `<code>/set_forward &lt;target_chat_id&gt; [only_forward: true/false]</code>\n` +
@@ -239,10 +239,10 @@ async function handleMessage(message, env) {
         channelName = rssUrl;
       }
     } else if (type === 'x') {
-      rssUrl = `https://rss.dreaife.tokyo/twitter/user/${arg}`;
+      rssUrl = `https://rsshub.app/twitter/user/${arg}`;
       channelName = arg;
     } else if (type === 'youtube') {
-      rssUrl = (env.RSS_BASE_URL || 'https://rss.dreaife.tokyo/youtube/live/') + arg;
+      rssUrl = (env.RSS_BASE_URL || 'https://rsshub.app/youtube/user/') + arg;
       channelName = arg;
     } else {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 'Unknown type. Use rss, x, or youtube.');

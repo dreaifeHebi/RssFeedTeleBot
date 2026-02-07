@@ -12,7 +12,7 @@ on:
 jobs:
   deploy:
     # if: github.event_name == 'push' || (github.event.pull_request.merged == true)
-    runs-on: selfN100
+    runs-on: [self-hosted, DESKTOP-PFNTFPI]
     name: Deploy
     steps:
       - uses: actions/checkout@v4

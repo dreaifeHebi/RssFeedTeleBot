@@ -12,7 +12,7 @@ on:
 jobs:
   deploy:
     # if: github.event_name == 'push' || (github.event.pull_request.merged == true)
-    runs-on: selfN100
+    runs-on: [self-hosted, DESKTOP-PFNTFPI]
     name: Deploy
     steps:
       - uses: actions/checkout@v4
@@ -23,9 +23,13 @@ jobs:
         run: |
           test -n "$TELEGRAM_BOT_TOKEN"
           test -n "$RSS_BASE_URL"
+          test -n "$KV_ID"
+          # Replace placeholder in wrangler.toml with actual KV ID
+          sed -i "s/TODO_REPLACE_WITH_YOUR_KV_ID/$KV_ID/g" wrangler.toml
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           RSS_BASE_URL: ${{ secrets.RSS_BASE_URL }}
+          KV_ID: ${{ secrets.KV_ID }}
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:

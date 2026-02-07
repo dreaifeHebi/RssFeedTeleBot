@@ -90,25 +90,27 @@ export default {
              } else if (entry.link && entry.link['@_href']) {
                 link = entry.link['@_href'];
              } else {
-                link = entry.link;
+                link = getXmlText(entry.link);
              }
              
              return {
-               title: entry.title,
+               title: getXmlText(entry.title),
                link: link,
-               id: entry.id,
-               pubDate: entry.published || entry.updated
+               id: getXmlText(entry.id),
+               pubDate: getXmlText(entry.published || entry.updated)
              };
           });
         } else if (feedRaw.rss && feedRaw.rss.channel && feedRaw.rss.channel.item) {
           feedTitle = feedRaw.rss.channel.title;
           const rssItems = Array.isArray(feedRaw.rss.channel.item) ? feedRaw.rss.channel.item : [feedRaw.rss.channel.item];
-          items = rssItems.map(item => ({
-            title: item.title,
-            link: item.link,
-            id: (item.guid && item.guid['#text']) ? item.guid['#text'] : (item.guid || item.link),
-            pubDate: item.pubDate
-          }));
+          items = rssItems.map(item => {
+            const title = getXmlText(item.title);
+            const link = getXmlText(item.link);
+            const guid = getXmlText(item.guid);
+            const id = guid || link;
+            const pubDate = getXmlText(item.pubDate);
+            return { title, link, id, pubDate };
+          });
         }
 
         console.log(feedTitle);
@@ -610,4 +612,12 @@ async function answerCallbackQuery(token, callbackQueryId, text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+}
+
+function getXmlText(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'object') {
+    return val['#text'] ? String(val['#text']) : '';
+  }
+  return String(val);
 }

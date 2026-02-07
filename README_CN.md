@@ -28,9 +28,9 @@
     *   创建一个名为 `RSS_BOT_KV` 的命名空间。
     *   复制刚刚创建的 **ID**。
 
-2.  **更新配置文件**:
-    *   打开本仓库中的 `wrangler.toml` 文件。
-    *   将 `TODO_REPLACE_WITH_YOUR_KV_ID` 替换为你的实际 KV ID。
+2.  **更新配置文件 (GitHub Actions 用户可选)**:
+    *   **如果使用 GitHub Actions (推荐)**: 你可以跳过此步骤。工作流会自动从仓库密钥中注入 `KV_ID`。
+    *   **如果手动部署**: 打开 `wrangler.toml` 并将 `TODO_REPLACE_WITH_YOUR_KV_ID` 替换为你的实际 KV ID。
     *   (可选) `preview_id` 可以保持原样，或者设置为相同的 ID 用于测试。
 
 ### 2. 部署

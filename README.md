@@ -28,9 +28,9 @@ A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTub
     *   Create a namespace named `RSS_BOT_KV`.
     *   Copy the **ID** of the namespace you just created.
 
-2.  **Update Configuration**:
-    *   Open `wrangler.toml` in this repository.
-    *   Replace `TODO_REPLACE_WITH_YOUR_KV_ID` with your actual KV ID.
+2.  **Update Configuration (Optional for GitHub Actions)**:
+    *   **If using GitHub Actions (Recommended)**: You can skip this step. The workflow will automatically inject the `KV_ID` from your repository secrets.
+    *   **If deploying manually**: Open `wrangler.toml` and replace `TODO_REPLACE_WITH_YOUR_KV_ID` with your actual KV ID.
     *   (Optional) You can leave `preview_id` as is or set it to the same ID for testing.
 
 ### 2. Deployment

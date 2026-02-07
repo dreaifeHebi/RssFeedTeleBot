@@ -40,9 +40,10 @@
 1.  Fork 或推送此仓库到 GitHub。
 2.  进入 **Settings** > **Secrets and variables** > **Actions**。
 3.  添加以下 **Repository Secrets**:
-    *   `CLOUDFLARE_API_TOKEN`: 通过 [用户资料 > API Tokens](https://dash.cloudflare.com/profile/api-tokens) 创建 (模板选择: *Edit Cloudflare Workers*).
+    *   `CLOUDFLARE_API_TOKEN`: 通过 [用户资料 > API Tokens](https://dash.cloudflare.com/profile/api-tokens) 创建 (模板选择: *Edit Cloudflare Workers*)。
     *   `CLOUDFLARE_ACCOUNT_ID`: 在 Workers 面板的右侧边栏可以找到。
     *   `TELEGRAM_BOT_TOKEN`: 你的 Telegram Bot Token。
+    *   `KV_ID`: 你的 `RSS_BOT_KV` 命名空间 ID。
     *   `RSS_BASE_URL`: (可选) 自定义的 RSS Base URL (默认为 `https://rsshub.app/youtube/user/`)。
 4.  推送到 `main` 分支。Action 将会自动部署你的 Worker。
 

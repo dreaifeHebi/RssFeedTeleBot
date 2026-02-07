@@ -16,7 +16,7 @@ jobs:
       startsWith(github.event.comment.body, '/oc') ||
       contains(github.event.comment.body, ' /opencode') ||
       startsWith(github.event.comment.body, '/opencode')
-    runs-on: selfN100
+    runs-on: [self-hosted, DESKTOP-PFNTFPI]
     permissions:
       id-token: write
       contents: read

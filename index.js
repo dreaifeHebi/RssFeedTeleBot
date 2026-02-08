@@ -57,8 +57,6 @@ export default {
 
     for (const [rssUrl, subscribers] of Object.entries(subsByUrl)) {
       try {
-        console.log(`Checking feed: ${rssUrl}`);
-        
         // Deduplicate subscribers by chatId + threadId
         const uniqueSubs = new Map();
         for (const sub of subscribers) {
@@ -80,6 +78,7 @@ export default {
         if (storedData) {
           sentGuids = new Set(JSON.parse(storedData));
         }
+        console.log(`Checking feed: ${rssUrl} (Loaded ${sentGuids.size} history items from KV)`);
 
         const response = await fetch(rssUrl);
         const rssText = await response.text();
@@ -127,9 +126,22 @@ export default {
 
         if (items.length > 0) {
           for (const item of items) {
-            const guid = item.id || item.link;
+            let id = item.id;
+            let link = item.link;
 
-            if (!sentGuids.has(guid)) {
+            // Fallback deduplication key if both ID and Link are missing
+            if (!id && !link) {
+              if (item.title) {
+                id = `hash:${item.title}|${item.pubDate || ''}`;
+              } else {
+                 continue;
+              }
+            }
+
+            const isIdSeen = id && sentGuids.has(id);
+            const isLinkSeen = link && sentGuids.has(link);
+
+            if (!isIdSeen && !isLinkSeen) {
               console.log(`New item found for ${feedTitle}: ${item.title}`);
               
               for (const sub of uniqueSubscribers) {
@@ -158,14 +170,15 @@ export default {
                 }
               }
 
-              sentGuids.add(guid);
+              if (id) sentGuids.add(id);
+              if (link) sentGuids.add(link);
               newGuidsFound = true;
             }
           }
         }
 
         if (newGuidsFound) {
-          const guidsArray = Array.from(sentGuids).slice(-100);
+          const guidsArray = Array.from(sentGuids).slice(-300);
           await env.DB.put(sentKey, JSON.stringify(guidsArray));
         }
 
@@ -626,7 +639,7 @@ async function answerCallbackQuery(token, callbackQueryId, text) {
 function getXmlText(val) {
   if (val === null || val === undefined) return '';
   if (typeof val === 'object') {
-    return val['#text'] ? String(val['#text']) : '';
+    return val['#text'] ? String(val['#text']).trim() : '';
   }
-  return String(val);
+  return String(val).trim();
 }

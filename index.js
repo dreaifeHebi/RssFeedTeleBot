@@ -59,12 +59,21 @@ export default {
       try {
         console.log(`Checking feed: ${rssUrl}`);
         
-        let hash = 0;
-        for (let i = 0; i < rssUrl.length; i++) {
-          hash = ((hash << 5) - hash) + rssUrl.charCodeAt(i);
-          hash |= 0;
+        // Deduplicate subscribers by chatId + threadId
+        const uniqueSubs = new Map();
+        for (const sub of subscribers) {
+            const key = `${sub.chatId}:${sub.threadId || ''}`;
+            if (!uniqueSubs.has(key)) {
+                uniqueSubs.set(key, sub);
+            }
         }
-        const sentKey = `sent_guids:${hash}`;
+        const uniqueSubscribers = Array.from(uniqueSubs.values());
+
+        const msgUint8 = new TextEncoder().encode(rssUrl);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        const sentKey = `sent_guids:${hashHex}`;
         
         let sentGuids = new Set();
         const storedData = await env.DB.get(sentKey);
@@ -90,25 +99,27 @@ export default {
              } else if (entry.link && entry.link['@_href']) {
                 link = entry.link['@_href'];
              } else {
-                link = entry.link;
+                link = getXmlText(entry.link);
              }
              
              return {
-               title: entry.title,
+               title: getXmlText(entry.title),
                link: link,
-               id: entry.id,
-               pubDate: entry.published || entry.updated
+               id: getXmlText(entry.id),
+               pubDate: getXmlText(entry.published || entry.updated)
              };
           });
         } else if (feedRaw.rss && feedRaw.rss.channel && feedRaw.rss.channel.item) {
           feedTitle = feedRaw.rss.channel.title;
           const rssItems = Array.isArray(feedRaw.rss.channel.item) ? feedRaw.rss.channel.item : [feedRaw.rss.channel.item];
-          items = rssItems.map(item => ({
-            title: item.title,
-            link: item.link,
-            id: (item.guid && item.guid['#text']) ? item.guid['#text'] : (item.guid || item.link),
-            pubDate: item.pubDate
-          }));
+          items = rssItems.map(item => {
+            const title = getXmlText(item.title);
+            const link = getXmlText(item.link);
+            const guid = getXmlText(item.guid);
+            const id = guid || link;
+            const pubDate = getXmlText(item.pubDate);
+            return { title, link, id, pubDate };
+          });
         }
 
         console.log(feedTitle);
@@ -119,16 +130,16 @@ export default {
             const guid = item.id || item.link;
 
             if (!sentGuids.has(guid)) {
-              const channelName = subscribers[0].channelName || feedTitle; 
-              console.log(`New item found for ${channelName}: ${item.title}`);
+              console.log(`New item found for ${feedTitle}: ${item.title}`);
               
-              const message = `🔴 <b>New Update!</b>\n\n` +
-                `<b>Title:</b> ${item.title}\n` +
-                `<b>Source:</b> ${channelName}\n` +
-                `<b>Link:</b> ${item.link}\n` +
-                `<b>Date:</b> ${item.pubDate}`;
+              for (const sub of uniqueSubscribers) {
+                const sourceName = sub.channelName || feedTitle;
+                const message = `🔴 <b>New Update!</b>\n\n` +
+                  `<b>Title:</b> ${item.title}\n` +
+                  `<b>Source:</b> ${sourceName}\n` +
+                  `<b>Link:</b> ${item.link}\n` +
+                  `<b>Date:</b> ${item.pubDate}`;
 
-              for (const sub of subscribers) {
                 let config = forwardConfigCache.get(sub.chatId);
                 if (config === undefined) {
                    const rawConfig = await env.DB.get(`forward_config:${sub.chatId}`);
@@ -610,4 +621,12 @@ async function answerCallbackQuery(token, callbackQueryId, text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+}
+
+function getXmlText(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'object') {
+    return val['#text'] ? String(val['#text']) : '';
+  }
+  return String(val);
 }

@@ -126,8 +126,17 @@ export default {
 
         if (items.length > 0) {
           for (const item of items) {
-            const id = item.id || item.link;
-            const link = item.link;
+            let id = item.id;
+            let link = item.link;
+
+            // Fallback deduplication key if both ID and Link are missing
+            if (!id && !link) {
+              if (item.title) {
+                id = `hash:${item.title}|${item.pubDate || ''}`;
+              } else {
+                 continue;
+              }
+            }
 
             const isIdSeen = id && sentGuids.has(id);
             const isLinkSeen = link && sentGuids.has(link);

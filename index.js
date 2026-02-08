@@ -1,5 +1,7 @@
 import { XMLParser } from 'fast-xml-parser';
 
+const SENT_HISTORY_LIMIT = 2000;
+
 export default {
   async fetch(request, env, ctx) {
     if (!env.TELEGRAM_BOT_TOKEN) {
@@ -126,22 +128,31 @@ export default {
 
         if (items.length > 0) {
           for (const item of items) {
-            let id = item.id;
-            let link = item.link;
+            const id = item.id || '';
+            const link = item.link || '';
+            const fingerprint = buildItemFingerprint(item);
 
-            // Fallback deduplication key if both ID and Link are missing
-            if (!id && !link) {
-              if (item.title) {
-                id = `hash:${item.title}|${item.pubDate || ''}`;
-              } else {
-                 continue;
-              }
+            let dedupKey = '';
+            if (fingerprint) {
+              dedupKey = `fp:${fingerprint}`;
+            } else if (id) {
+              dedupKey = `id:${id}`;
+            } else if (link) {
+              dedupKey = `link:${link}`;
+            } else if (item.title) {
+              dedupKey = `fallback:${item.title}|${item.pubDate || ''}`;
+            } else {
+              continue;
             }
 
-            const isIdSeen = id && sentGuids.has(id);
-            const isLinkSeen = link && sentGuids.has(link);
+            // Keep backward compatibility with legacy keys stored without prefixes.
+            const isSeen =
+              sentGuids.has(dedupKey) ||
+              (id && (sentGuids.has(id) || sentGuids.has(`id:${id}`))) ||
+              (link && (sentGuids.has(link) || sentGuids.has(`link:${link}`))) ||
+              (fingerprint && sentGuids.has(`fp:${fingerprint}`));
 
-            if (!isIdSeen && !isLinkSeen) {
+            if (!isSeen) {
               console.log(`New item found for ${feedTitle}: ${item.title}`);
               
               for (const sub of uniqueSubscribers) {
@@ -170,15 +181,14 @@ export default {
                 }
               }
 
-              if (id) sentGuids.add(id);
-              if (link) sentGuids.add(link);
+              sentGuids.add(dedupKey);
               newGuidsFound = true;
             }
           }
         }
 
         if (newGuidsFound) {
-          const guidsArray = Array.from(sentGuids).slice(-300);
+          const guidsArray = Array.from(sentGuids).slice(-SENT_HISTORY_LIMIT);
           await env.DB.put(sentKey, JSON.stringify(guidsArray));
         }
 
@@ -593,6 +603,69 @@ function extractPathname(urlOrPath = '') {
   } catch (e) {
     return value;
   }
+}
+
+function buildItemFingerprint(item) {
+  const title = String(item?.title || '').trim().toLowerCase();
+  const id = String(item?.id || '').trim().toLowerCase();
+  const normalizedLink = normalizeUrlForDedup(item?.link || '');
+  const pubDate = String(item?.pubDate || '').trim().toLowerCase();
+
+  if (!title && !id && !normalizedLink && !pubDate) {
+    return '';
+  }
+
+  // Prefer stable content identity over volatile feed IDs.
+  const base = (title || normalizedLink)
+    ? `${title}|${normalizedLink}`
+    : `${id}|${pubDate}`;
+  return simpleHash(base);
+}
+
+function normalizeUrlForDedup(rawUrl = '') {
+  const value = String(rawUrl || '').trim();
+  if (!value) {
+    return '';
+  }
+
+  try {
+    const url = new URL(value);
+    const dropParams = new Set([
+      'utm_source',
+      'utm_medium',
+      'utm_campaign',
+      'utm_term',
+      'utm_content',
+      'utm_name',
+      'utm_id',
+      'fbclid',
+      'gclid',
+      'igshid',
+      'spm',
+      'from'
+    ]);
+
+    for (const key of Array.from(url.searchParams.keys())) {
+      if (dropParams.has(key.toLowerCase())) {
+        url.searchParams.delete(key);
+      }
+    }
+
+    url.hash = '';
+    const normalizedPath = url.pathname.replace(/\/+$/, '') || '/';
+    const query = url.searchParams.toString();
+    return `${url.origin.toLowerCase()}${normalizedPath}${query ? `?${query}` : ''}`;
+  } catch (e) {
+    return value.toLowerCase();
+  }
+}
+
+function simpleHash(input = '') {
+  let h = 5381;
+  for (let i = 0; i < input.length; i++) {
+    h = ((h << 5) + h) ^ input.charCodeAt(i);
+  }
+  return (h >>> 0).toString(16);
 }
 
 async function sendTelegramMessage(token, chatId, threadId, text, replyMarkup = null) {

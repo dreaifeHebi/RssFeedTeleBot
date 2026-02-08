@@ -1,6 +1,7 @@
 import { XMLParser } from 'fast-xml-parser';
 
 const SENT_HISTORY_LIMIT = 2000;
+const MAX_TELEGRAM_SENDS_PER_RUN = 35;
 
 export default {
   async fetch(request, env, ctx) {
@@ -56,7 +57,9 @@ export default {
     }
 
     const forwardConfigCache = new Map();
+    const sendBudget = { remaining: MAX_TELEGRAM_SENDS_PER_RUN };
 
+    feedLoop:
     for (const [rssUrl, subscribers] of Object.entries(subsByUrl)) {
       try {
         // Deduplicate subscribers by chatId + threadId
@@ -93,15 +96,7 @@ export default {
           feedTitle = feedRaw.feed.title;
           const entries = Array.isArray(feedRaw.feed.entry) ? feedRaw.feed.entry : [feedRaw.feed.entry];
           items = entries.map(entry => {
-             let link = '';
-             if (Array.isArray(entry.link)) {
-                const alt = entry.link.find(l => l['@_rel'] === 'alternate');
-                link = alt ? alt['@_href'] : entry.link[0]['@_href'];
-             } else if (entry.link && entry.link['@_href']) {
-                link = entry.link['@_href'];
-             } else {
-                link = getXmlText(entry.link);
-             }
+             const link = extractFeedLink(entry.link);
              
              return {
                title: getXmlText(entry.title),
@@ -115,7 +110,7 @@ export default {
           const rssItems = Array.isArray(feedRaw.rss.channel.item) ? feedRaw.rss.channel.item : [feedRaw.rss.channel.item];
           items = rssItems.map(item => {
             const title = getXmlText(item.title);
-            const link = getXmlText(item.link);
+            const link = extractFeedLink(item.link);
             const guid = getXmlText(item.guid);
             const id = guid || link;
             const pubDate = getXmlText(item.pubDate);
@@ -125,9 +120,15 @@ export default {
 
         console.log(feedTitle);
         let newGuidsFound = false;
+        let budgetExhausted = false;
 
         if (items.length > 0) {
           for (const item of items) {
+            if (sendBudget.remaining <= 0) {
+              budgetExhausted = true;
+              break;
+            }
+
             const id = item.id || '';
             const link = item.link || '';
             const fingerprint = buildItemFingerprint(item);
@@ -154,15 +155,16 @@ export default {
 
             if (!isSeen) {
               console.log(`New item found for ${feedTitle}: ${item.title}`);
-              
-              for (const sub of uniqueSubscribers) {
-                const sourceName = sub.channelName || feedTitle;
-                const message = `🔴 <b>New Update!</b>\n\n` +
-                  `<b>Title:</b> ${item.title}\n` +
-                  `<b>Source:</b> ${sourceName}\n` +
-                  `<b>Link:</b> ${item.link}\n` +
-                  `<b>Date:</b> ${item.pubDate}`;
 
+              const messageSourceName = uniqueSubscribers[0]?.channelName || feedTitle;
+              const message = `🔴 <b>New Update!</b>\n\n` +
+                `<b>Title:</b> ${item.title}\n` +
+                `<b>Source:</b> ${messageSourceName}\n` +
+                `<b>Link:</b> ${item.link}\n` +
+                `<b>Date:</b> ${item.pubDate}`;
+
+              const targets = [];
+              for (const sub of uniqueSubscribers) {
                 let config = forwardConfigCache.get(sub.chatId);
                 if (config === undefined) {
                    const rawConfig = await env.DB.get(`forward_config:${sub.chatId}`);
@@ -171,18 +173,54 @@ export default {
                 }
 
                 if (config) {
-                   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, config.targetChatId, null, message);
-                   
+                   targets.push({ chatId: config.targetChatId, threadId: null });
+
                    if (!config.onlyForward) {
-                     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, sub.chatId, sub.threadId, message);
+                     targets.push({ chatId: sub.chatId, threadId: sub.threadId });
                    }
                 } else {
-                   await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, sub.chatId, sub.threadId, message);
+                   targets.push({ chatId: sub.chatId, threadId: sub.threadId });
                 }
               }
 
-              sentGuids.add(dedupKey);
-              newGuidsFound = true;
+              const uniqueTargets = new Map();
+              for (const target of targets) {
+                const key = `${target.chatId}:${target.threadId || ''}`;
+                if (!uniqueTargets.has(key)) {
+                  uniqueTargets.set(key, target);
+                }
+              }
+              const targetList = Array.from(uniqueTargets.values());
+
+              if (sendBudget.remaining < targetList.length) {
+                console.warn(
+                  `Skip item due to send budget. Remaining=${sendBudget.remaining}, required=${targetList.length}, feed=${rssUrl}`
+                );
+                budgetExhausted = true;
+                break;
+              }
+
+              let successCount = 0;
+              for (const target of targetList) {
+                const ok = await sendTelegramMessage(
+                  env.TELEGRAM_BOT_TOKEN,
+                  target.chatId,
+                  target.threadId,
+                  message,
+                  null,
+                  { sendBudget }
+                );
+                if (ok) {
+                  successCount++;
+                }
+              }
+
+              if (successCount > 0) {
+                sentGuids.add(dedupKey);
+                newGuidsFound = true;
+              } else {
+                console.warn(`All sends failed for item: ${item.title} (${rssUrl})`);
+              }
             }
           }
         }
@@ -190,6 +228,11 @@ export default {
         if (newGuidsFound) {
           const guidsArray = Array.from(sentGuids).slice(-SENT_HISTORY_LIMIT);
           await env.DB.put(sentKey, JSON.stringify(guidsArray));
+        }
+
+        if (budgetExhausted) {
+          console.warn('Telegram send budget exhausted for this run. Remaining feeds will continue next cron.');
+          break feedLoop;
         }
 
       } catch (error) {
@@ -668,7 +711,32 @@ function simpleHash(input = '') {
   return (h >>> 0).toString(16);
 }
 
-async function sendTelegramMessage(token, chatId, threadId, text, replyMarkup = null) {
+function extractRetryAfterSeconds(responseBody = '') {
+  try {
+    const parsed = JSON.parse(responseBody);
+    const retryAfter = Number(parsed?.parameters?.retry_after);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+      return Math.ceil(retryAfter);
+    }
+  } catch (e) {
+    // Ignore parse errors and skip retry.
+  }
+  return 0;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendTelegramMessage(token, chatId, threadId, text, replyMarkup = null, options = {}) {
+  const sendBudget = options?.sendBudget || null;
+  if (sendBudget) {
+    if (sendBudget.remaining <= 0) {
+      return false;
+    }
+    sendBudget.remaining -= 1;
+  }
+
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const payload = {
     chat_id: chatId,
@@ -683,15 +751,36 @@ async function sendTelegramMessage(token, chatId, threadId, text, replyMarkup = 
   if (replyMarkup) {
     payload.reply_markup = replyMarkup;
   }
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  
-  if (!response.ok) {
-    console.error(`Failed to send message to ${chatId} (${threadId}):`, await response.text());
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (response.ok) {
+      return true;
+    }
+
+    const responseBody = await response.text();
+    if (response.status === 429 && !options._isRetry) {
+      const retryAfterSeconds = extractRetryAfterSeconds(responseBody);
+      if (retryAfterSeconds > 0) {
+        console.warn(`Telegram 429 for ${chatId} (${threadId}), retrying in ${retryAfterSeconds}s`);
+        await sleep((retryAfterSeconds + 1) * 1000);
+        return sendTelegramMessage(token, chatId, threadId, text, replyMarkup, {
+          ...options,
+          _isRetry: true
+        });
+      }
+    }
+
+    console.error(`Failed to send message to ${chatId} (${threadId}):`, responseBody);
+    return false;
+  } catch (error) {
+    console.error(`Send message exception to ${chatId} (${threadId}):`, error);
+    return false;
   }
 }
 
@@ -715,4 +804,39 @@ function getXmlText(val) {
     return val['#text'] ? String(val['#text']).trim() : '';
   }
   return String(val).trim();
+}
+
+function extractFeedLink(linkNode) {
+  if (linkNode === null || linkNode === undefined) {
+    return '';
+  }
+
+  if (Array.isArray(linkNode)) {
+    const alternate = linkNode.find((l) => {
+      const rel = String(l?.['@_rel'] || l?.rel || '').toLowerCase();
+      return rel === 'alternate';
+    });
+    return extractFeedLink(alternate || linkNode[0]);
+  }
+
+  if (typeof linkNode === 'string') {
+    return linkNode.trim();
+  }
+
+  if (typeof linkNode === 'object') {
+    if (typeof linkNode['@_href'] === 'string') {
+      return linkNode['@_href'].trim();
+    }
+    if (typeof linkNode.href === 'string') {
+      return linkNode.href.trim();
+    }
+    if (typeof linkNode['#text'] === 'string') {
+      return linkNode['#text'].trim();
+    }
+    if (typeof linkNode.url === 'string') {
+      return linkNode.url.trim();
+    }
+  }
+
+  return getXmlText(linkNode);
 }

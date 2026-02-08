@@ -59,12 +59,21 @@ export default {
       try {
         console.log(`Checking feed: ${rssUrl}`);
         
-        let hash = 0;
-        for (let i = 0; i < rssUrl.length; i++) {
-          hash = ((hash << 5) - hash) + rssUrl.charCodeAt(i);
-          hash |= 0;
+        // Deduplicate subscribers by chatId + threadId
+        const uniqueSubs = new Map();
+        for (const sub of subscribers) {
+            const key = `${sub.chatId}:${sub.threadId || ''}`;
+            if (!uniqueSubs.has(key)) {
+                uniqueSubs.set(key, sub);
+            }
         }
-        const sentKey = `sent_guids:${hash}`;
+        const uniqueSubscribers = Array.from(uniqueSubs.values());
+
+        const msgUint8 = new TextEncoder().encode(rssUrl);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        const sentKey = `sent_guids:${hashHex}`;
         
         let sentGuids = new Set();
         const storedData = await env.DB.get(sentKey);
@@ -121,16 +130,16 @@ export default {
             const guid = item.id || item.link;
 
             if (!sentGuids.has(guid)) {
-              const channelName = subscribers[0].channelName || feedTitle; 
-              console.log(`New item found for ${channelName}: ${item.title}`);
+              console.log(`New item found for ${feedTitle}: ${item.title}`);
               
-              const message = `🔴 <b>New Update!</b>\n\n` +
-                `<b>Title:</b> ${item.title}\n` +
-                `<b>Source:</b> ${channelName}\n` +
-                `<b>Link:</b> ${item.link}\n` +
-                `<b>Date:</b> ${item.pubDate}`;
+              for (const sub of uniqueSubscribers) {
+                const sourceName = sub.channelName || feedTitle;
+                const message = `🔴 <b>New Update!</b>\n\n` +
+                  `<b>Title:</b> ${item.title}\n` +
+                  `<b>Source:</b> ${sourceName}\n` +
+                  `<b>Link:</b> ${item.link}\n` +
+                  `<b>Date:</b> ${item.pubDate}`;
 
-              for (const sub of subscribers) {
                 let config = forwardConfigCache.get(sub.chatId);
                 if (config === undefined) {
                    const rawConfig = await env.DB.get(`forward_config:${sub.chatId}`);

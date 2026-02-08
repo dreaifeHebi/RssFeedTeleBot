@@ -8,10 +8,15 @@ on:
   push:
     tags:
       - 'v*'  # 只有以 v 开头的 tag 才会触发（例如 v1.0.0）
+  pull_request:
+    types:
+      - closed
+    branches:
+      - master
 
 jobs:
   deploy:
-    # if: github.event_name == 'push' || (github.event.pull_request.merged == true)
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true)
     runs-on: [self-hosted, DESKTOP-PFNTFPI]
     name: Deploy
     steps:

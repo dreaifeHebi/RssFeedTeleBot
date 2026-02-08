@@ -57,8 +57,6 @@ export default {
 
     for (const [rssUrl, subscribers] of Object.entries(subsByUrl)) {
       try {
-        console.log(`Checking feed: ${rssUrl}`);
-        
         // Deduplicate subscribers by chatId + threadId
         const uniqueSubs = new Map();
         for (const sub of subscribers) {
@@ -80,6 +78,7 @@ export default {
         if (storedData) {
           sentGuids = new Set(JSON.parse(storedData));
         }
+        console.log(`Checking feed: ${rssUrl} (Loaded ${sentGuids.size} history items from KV)`);
 
         const response = await fetch(rssUrl);
         const rssText = await response.text();

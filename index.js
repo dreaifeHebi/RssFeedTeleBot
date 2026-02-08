@@ -127,9 +127,13 @@ export default {
 
         if (items.length > 0) {
           for (const item of items) {
-            const guid = item.id || item.link;
+            const id = item.id || item.link;
+            const link = item.link;
 
-            if (!sentGuids.has(guid)) {
+            const isIdSeen = id && sentGuids.has(id);
+            const isLinkSeen = link && sentGuids.has(link);
+
+            if (!isIdSeen && !isLinkSeen) {
               console.log(`New item found for ${feedTitle}: ${item.title}`);
               
               for (const sub of uniqueSubscribers) {
@@ -158,14 +162,15 @@ export default {
                 }
               }
 
-              sentGuids.add(guid);
+              if (id) sentGuids.add(id);
+              if (link) sentGuids.add(link);
               newGuidsFound = true;
             }
           }
         }
 
         if (newGuidsFound) {
-          const guidsArray = Array.from(sentGuids).slice(-100);
+          const guidsArray = Array.from(sentGuids).slice(-300);
           await env.DB.put(sentKey, JSON.stringify(guidsArray));
         }
 
@@ -626,7 +631,7 @@ async function answerCallbackQuery(token, callbackQueryId, text) {
 function getXmlText(val) {
   if (val === null || val === undefined) return '';
   if (typeof val === 'object') {
-    return val['#text'] ? String(val['#text']) : '';
+    return val['#text'] ? String(val['#text']).trim() : '';
   }
-  return String(val);
+  return String(val).trim();
 }

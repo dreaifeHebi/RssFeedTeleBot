@@ -288,7 +288,7 @@ async function handleMessage(message, env) {
       `/add x &lt;username&gt; - Add X user\n` +
       `/del [type] &lt;name&gt; - Remove subscription\n` +
       `/list - List subscriptions\n` +
-      `/set_forward - Configure forwarding\n` +
+      `/set_forward - Configure forwarding (Scope: topic/global)\n` +
       `/help - Show help`;
     
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, welcomeMsg);
@@ -305,7 +305,7 @@ async function handleMessage(message, env) {
       `<code>/set_forward &lt;target_chat_id&gt; [target_thread_id] [only_forward] [scope]</code>\n` +
       `Scope: <code>topic</code> (default) or <code>global</code>\n` +
       `Example: <code>/set_forward -100 10 true global</code> (Sets global forward for this group)\n` +
-      `To remove: <code>/del_forward</code> (Removes config for current scope)\n\n` +
+      `To remove: <code>/del_forward [scope]</code> (default: topic)\n\n` +
       `<b>3. Manage Subscriptions</b>\n` +
       `- List: <code>/list</code>\n` +
       `- Remove: <code>/del [type] &lt;name&gt;</code>\n` +

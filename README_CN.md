@@ -112,14 +112,23 @@ curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=<YOUR_WORKER_U
 *   **转发设置**:
     配置将消息转发到另一个频道/群组。
     ```text
-    /set_forward <target_chat_id> [only_forward: true/false]
+    /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]
     ```
-    *示例: `/set_forward -100123456789 true` (仅发送到目标聊天)*
+    *   `target_thread_id`: 可选。转发到目标群组的指定 Topic。
+    *   `only_forward`: 可选。`true` 表示不再发送到源群组，`false` 表示保留。
+    *   `scope`: 可选。`topic` (默认) 或 `global`。
+        *   `topic`: 仅适用于当前源 Topic。
+        *   `global`: 适用于整个源群组（所有 Topic）。
+
+    *示例:*
+    *   `/set_forward -100123456789 123 true global` (全局转发到目标 Topic 123)
+    *   `/set_forward -100123456789 456 false topic` (仅当前 Topic 转发到目标 Topic 456)
     
     移除配置:
     ```text
-    /del_forward
+    /del_forward [scope]
     ```
+    *   默认为 `topic`。使用 `/del_forward global` 移除全局配置。
 
 *   **转发订阅 (批量复制)**:
     允许将当前会话的订阅复制到另一个会话（群组/频道）。

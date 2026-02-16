@@ -112,14 +112,23 @@ Add the bot to your Group or Supergroup.
 *   **Forwarding Settings**:
     Configure message forwarding to another channel/group.
     ```text
-    /set_forward <target_chat_id> [only_forward: true/false]
+    /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]
     ```
-    *Example: `/set_forward -100123456789 true` (Sends ONLY to target)*
+    *   `target_thread_id`: Optional. Forward to a specific topic/thread in the target group.
+    *   `only_forward`: Optional. `true` to stop sending to source, `false` to keep both.
+    *   `scope`: Optional. `topic` (default) or `global`.
+        *   `topic`: Applies only to the current source topic/thread.
+        *   `global`: Applies to the entire source chat (all topics).
+
+    *Example:*
+    *   `/set_forward -100123456789 123 true global` (Global forward to target topic 123)
+    *   `/set_forward -100123456789 456 false topic` (Topic forward to target topic 456)
     
     To remove:
     ```text
-    /del_forward
+    /del_forward [scope]
     ```
+    *   Default scope is `topic`. Use `/del_forward global` to remove global config.
 
 *   **Forward Subscriptions (Bulk Copy)**:
     Allows copying subscriptions from the current chat to another chat.

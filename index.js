@@ -165,11 +165,44 @@ export default {
 
               const targets = [];
               for (const sub of uniqueSubscribers) {
-                let config = forwardConfigCache.get(sub.chatId);
-                if (config === undefined) {
-                   const rawConfig = await env.DB.get(`forward_config:${sub.chatId}`);
-                   config = rawConfig ? JSON.parse(rawConfig) : null;
-                   forwardConfigCache.set(sub.chatId, config);
+                let config = null;
+                
+                if (sub.threadId) {
+                   const topicKey = `${sub.chatId}:${sub.threadId}`;
+                   if (forwardConfigCache.has(topicKey)) {
+                      config = forwardConfigCache.get(topicKey);
+                   } else {
+                      const rawTopicConfig = await env.DB.get(`forward_config:${sub.chatId}:${sub.threadId}`);
+                      if (rawTopicConfig) {
+                        config = JSON.parse(rawTopicConfig);
+                        forwardConfigCache.set(topicKey, config);
+                      }
+                   }
+                }
+                
+                if (!config) {
+                   const globalKey = `${sub.chatId}`;
+                   let globalConfig = null;
+                   
+                   if (forwardConfigCache.has(globalKey)) {
+                      globalConfig = forwardConfigCache.get(globalKey);
+                   } else {
+                      const rawGlobalConfig = await env.DB.get(`forward_config:${sub.chatId}`);
+                      if (rawGlobalConfig) {
+                         globalConfig = JSON.parse(rawGlobalConfig);
+                         forwardConfigCache.set(globalKey, globalConfig);
+                      }
+                   }
+                   
+                   if (globalConfig) {
+                      if (sub.threadId) {
+                         if (globalConfig.isGlobal) {
+                            config = globalConfig;
+                         }
+                      } else {
+                         config = globalConfig;
+                      }
+                   }
                 }
 
                 if (config) {
@@ -269,9 +302,10 @@ async function handleMessage(message, env) {
       `- YouTube: <code>/add youtube username</code>\n\n` +
       `<b>2. Forwarding Settings</b>\n` +
       `Configure message forwarding to another channel/group/topic:\n` +
-      `<code>/set_forward &lt;target_chat_id&gt; [target_thread_id] [only_forward]</code>\n` +
-      `Example: <code>/set_forward -100123456789 10 true</code> (Sends to target thread 10)\n` +
-      `To remove: <code>/del_forward</code>\n\n` +
+      `<code>/set_forward &lt;target_chat_id&gt; [target_thread_id] [only_forward] [scope]</code>\n` +
+      `Scope: <code>topic</code> (default) or <code>global</code>\n` +
+      `Example: <code>/set_forward -100 10 true global</code> (Sets global forward for this group)\n` +
+      `To remove: <code>/del_forward</code> (Removes config for current scope)\n\n` +
       `<b>3. Manage Subscriptions</b>\n` +
       `- List: <code>/list</code>\n` +
       `- Remove: <code>/del [type] &lt;name&gt;</code>\n` +
@@ -341,8 +375,9 @@ async function handleMessage(message, env) {
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 
-        'Usage: /set_forward <target_chat_id> [target_thread_id] [only_forward: true/false]\n' +
-        'Example: /set_forward -100123456789 123 true'
+        'Usage: /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]\n' +
+        'Scope: "topic" (default) or "global"\n' +
+        'Example: /set_forward -100123456789 123 true global'
       );
       return new Response('OK');
     }
@@ -350,41 +385,91 @@ async function handleMessage(message, env) {
     const targetChatId = parseInt(parts[1]);
     let targetThreadId = null;
     let onlyForward = false;
+    let isGlobal = false;
     
     if (isNaN(targetChatId)) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, '⚠️ Invalid Target Chat ID.');
       return new Response('OK');
     }
 
-    if (parts.length > 2) {
-      const arg2 = parts[2].toLowerCase();
-      if (arg2 === 'true' || arg2 === 'false') {
-        onlyForward = arg2 === 'true';
+    for (let i = 2; i < parts.length; i++) {
+      const arg = parts[i].toLowerCase();
+      
+      if (arg === 'true' || arg === 'false') {
+        onlyForward = arg === 'true';
+      } else if (arg === 'global' || arg === 'all') {
+        isGlobal = true;
+      } else if (arg === 'topic') {
+        isGlobal = false;
       } else {
-        const parsedThreadId = parseInt(parts[2]);
+        const parsedThreadId = parseInt(arg);
         if (!isNaN(parsedThreadId)) {
           targetThreadId = parsedThreadId;
-          if (parts.length > 3) {
-             onlyForward = parts[3].toLowerCase() === 'true';
-          }
         }
       }
     }
 
-    const config = { targetChatId, targetThreadId, onlyForward };
-    await env.DB.put(`forward_config:${chatId}`, JSON.stringify(config));
+    const config = { targetChatId, targetThreadId, onlyForward, isGlobal };
+    
+    let key = `forward_config:${chatId}`;
+    let scopeText = "Global (All Topics)";
+    
+    if (!isGlobal && threadId) {
+      key = `forward_config:${chatId}:${threadId}`;
+      scopeText = `This Topic (${threadId})`;
+    } else if (!isGlobal && !threadId) {
+       scopeText = "Global (Default)";
+    }
+      }
+    }
+
+    const config = { targetChatId, targetThreadId, onlyForward, isGlobal };
+    
+    // Key Logic:
+    // If Global -> forward_config:${chatId}
+    // If Topic -> forward_config:${chatId}:${threadId} (if threadId exists)
+    // If Topic but no threadId (Main Thread) -> forward_config:${chatId} (treat as global implicitly or just main thread config)
+    
+    let key = `forward_config:${chatId}`;
+    let scopeText = "Global (All Topics)";
+    
+    if (!isGlobal && threadId) {
+      key = `forward_config:${chatId}:${threadId}`;
+      scopeText = `This Topic (${threadId})`;
+    } else if (!isGlobal && !threadId) {
+       scopeText = "Global (Default)";
+    }
+
+    await env.DB.put(key, JSON.stringify(config));
     
     let msg = `✅ Forwarding configured.\nTarget: ${targetChatId}`;
     if (targetThreadId) {
       msg += `\nThread ID: ${targetThreadId}`;
     }
     msg += `\nOnly Forward: ${onlyForward}`;
+    msg += `\nScope: ${scopeText}`;
     
     await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, msg);
   }
   else if (text.startsWith('/del_forward')) {
-    await env.DB.delete(`forward_config:${chatId}`);
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, '✅ Forwarding configuration removed.');
+    const parts = text.split(/\s+/);
+    let isGlobal = false;
+    for (const part of parts) {
+       if (part.toLowerCase() === 'global' || part.toLowerCase() === 'all') {
+          isGlobal = true;
+       }
+    }
+    
+    let key = `forward_config:${chatId}`;
+    let scopeText = "Global";
+    
+    if (!isGlobal && threadId) {
+      key = `forward_config:${chatId}:${threadId}`;
+      scopeText = `This Topic (${threadId})`;
+    }
+    
+    await env.DB.delete(key);
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, `✅ Forwarding configuration removed for scope: ${scopeText}.`);
   }
   else if (text.startsWith('/del') || text.startsWith('/remove')) {
     const parts = text.split(/\s+/);

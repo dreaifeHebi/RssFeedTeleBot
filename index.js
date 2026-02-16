@@ -420,18 +420,11 @@ async function handleMessage(message, env) {
     } else if (!isGlobal && !threadId) {
        scopeText = "Global (Default)";
     }
-      }
-    }
 
-    const config = { targetChatId, targetThreadId, onlyForward, isGlobal };
-    
     // Key Logic:
     // If Global -> forward_config:${chatId}
     // If Topic -> forward_config:${chatId}:${threadId} (if threadId exists)
     // If Topic but no threadId (Main Thread) -> forward_config:${chatId} (treat as global implicitly or just main thread config)
-    
-    let key = `forward_config:${chatId}`;
-    let scopeText = "Global (All Topics)";
     
     if (!isGlobal && threadId) {
       key = `forward_config:${chatId}:${threadId}`;

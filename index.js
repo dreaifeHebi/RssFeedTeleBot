@@ -173,7 +173,7 @@ export default {
                 }
 
                 if (config) {
-                   targets.push({ chatId: config.targetChatId, threadId: null });
+                   targets.push({ chatId: config.targetChatId, threadId: config.targetThreadId || null });
 
                    if (!config.onlyForward) {
                      targets.push({ chatId: sub.chatId, threadId: sub.threadId });
@@ -268,9 +268,9 @@ async function handleMessage(message, env) {
       `- X (Twitter): <code>/add x username</code>\n` +
       `- YouTube: <code>/add youtube username</code>\n\n` +
       `<b>2. Forwarding Settings</b>\n` +
-      `Configure message forwarding to another channel/group:\n` +
-      `<code>/set_forward &lt;target_chat_id&gt; [only_forward: true/false]</code>\n` +
-      `Example: <code>/set_forward -100123456789 true</code> (Sends ONLY to target)\n` +
+      `Configure message forwarding to another channel/group/topic:\n` +
+      `<code>/set_forward &lt;target_chat_id&gt; [target_thread_id] [only_forward]</code>\n` +
+      `Example: <code>/set_forward -100123456789 10 true</code> (Sends to target thread 10)\n` +
       `To remove: <code>/del_forward</code>\n\n` +
       `<b>3. Manage Subscriptions</b>\n` +
       `- List: <code>/list</code>\n` +
@@ -341,25 +341,46 @@ async function handleMessage(message, env) {
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 
-        'Usage: /set_forward <target_chat_id> [only_forward: true/false]\n' +
-        'Example: /set_forward -100123456789 true'
+        'Usage: /set_forward <target_chat_id> [target_thread_id] [only_forward: true/false]\n' +
+        'Example: /set_forward -100123456789 123 true'
       );
       return new Response('OK');
     }
 
     const targetChatId = parseInt(parts[1]);
-    const onlyForward = parts.length > 2 ? parts[2].toLowerCase() === 'true' : false;
+    let targetThreadId = null;
+    let onlyForward = false;
     
     if (isNaN(targetChatId)) {
       await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, '⚠️ Invalid Target Chat ID.');
       return new Response('OK');
     }
 
-    const config = { targetChatId, onlyForward };
+    if (parts.length > 2) {
+      const arg2 = parts[2].toLowerCase();
+      if (arg2 === 'true' || arg2 === 'false') {
+        onlyForward = arg2 === 'true';
+      } else {
+        const parsedThreadId = parseInt(parts[2]);
+        if (!isNaN(parsedThreadId)) {
+          targetThreadId = parsedThreadId;
+          if (parts.length > 3) {
+             onlyForward = parts[3].toLowerCase() === 'true';
+          }
+        }
+      }
+    }
+
+    const config = { targetChatId, targetThreadId, onlyForward };
     await env.DB.put(`forward_config:${chatId}`, JSON.stringify(config));
-    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, 
-      `✅ Forwarding configured.\nTarget: ${targetChatId}\nOnly Forward: ${onlyForward}`
-    );
+    
+    let msg = `✅ Forwarding configured.\nTarget: ${targetChatId}`;
+    if (targetThreadId) {
+      msg += `\nThread ID: ${targetThreadId}`;
+    }
+    msg += `\nOnly Forward: ${onlyForward}`;
+    
+    await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, threadId, msg);
   }
   else if (text.startsWith('/del_forward')) {
     await env.DB.delete(`forward_config:${chatId}`);

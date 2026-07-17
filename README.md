@@ -2,80 +2,135 @@
 
 [中文文档](README_CN.md) | English
 
-A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTube channels (via RSSHub) and sends notifications to Telegram chats, supergroups, and topics. Run entirely on Cloudflare Workers (Free Tier compatible).
+A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTube channels (via RSSHub), then sends notifications to Telegram chats, supergroups, and topics. It runs on Cloudflare Workers with D1, KV, and Cron Triggers.
 
 ## Features
 
 - **Serverless**: Runs on Cloudflare Workers (no VPS required).
 - **Interactive Management**: Add/remove subscriptions directly from Telegram.
-- **Topic Support**: Fully supports Telegram Supergroup Topics (Threads).
+- **Topic Support**: Supports Telegram supergroup topics (threads).
 - **Multi-Subscription**: Monitor multiple feeds.
 - **Selective Forwarding**: Forward notifications to another chat, with option to mute source.
-- **Cost Efficient**: Uses Cloudflare KV for state and Cron Triggers for scheduling.
+- **Durable Delivery**: D1 stores subscriptions, processed webhook IDs, and per-target outbox deliveries.
+- **Safer Operations**: Authenticated webhooks, command authorization, bounded feed fetching, and retryable Telegram delivery.
 
 ## Prerequisites
 
-1.  **Cloudflare Account**: [Sign up here](https://dash.cloudflare.com/sign-up).
-2.  **Telegram Bot Token**: Get one from [@BotFather](https://t.me/BotFather).
-3.  **GitHub Account**: For deployment via GitHub Actions.
+1. **Cloudflare account**: [Sign up here](https://dash.cloudflare.com/sign-up).
+2. **Telegram bot token**: Get one from [@BotFather](https://t.me/BotFather).
+3. **Node.js 20+** and npm for local setup.
+4. **GitHub account** only if you use the included deployment workflow.
 
 ## Setup Guide
 
-### 1. Cloudflare Configuration
-
-1.  **Create a KV Namespace**:
-    *   Go to **Cloudflare Dashboard** > **Workers & Pages** > **KV**.
-    *   Create a namespace named `RSS_BOT_KV`.
-    *   Copy the **ID** of the namespace you just created.
-
-2.  **Update Configuration (Optional for GitHub Actions)**:
-    *   **If using GitHub Actions (Recommended)**: You can skip this step. The workflow will automatically inject the `KV_ID` from your repository secrets.
-    *   **If deploying manually**: Open `wrangler.toml` and replace `TODO_REPLACE_WITH_YOUR_KV_ID` with your actual KV ID.
-    *   (Optional) You can leave `preview_id` as is or set it to the same ID for testing.
-
-### 2. Deployment
-
-#### Option A: GitHub Actions (Recommended)
-
-1.  Fork or push this repository to GitHub.
-2.  Go to **Settings** > **Secrets and variables** > **Actions**.
-3.  Add the following **Repository Secrets**:
-    *   `CLOUDFLARE_API_TOKEN`: Create via [User Profile > API Tokens](https://dash.cloudflare.com/profile/api-tokens) (Template: *Edit Cloudflare Workers*).
-    *   `CLOUDFLARE_ACCOUNT_ID`: Found on the right sidebar of your Workers dashboard.
-    *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
-    *   `KV_ID`: The ID of your `RSS_BOT_KV` namespace.
-    *   `RSS_BASE_URL`: (Optional) Custom RSSHub base URL (defaults to `https://rsshub.app`). Supports host-only or base path (e.g. `https://rsshub.app` or `https://your-rsshub.example.com/proxy`). Legacy full-route values (like `/youtube/user`) are auto-normalized.
-4.  Push to the `main` branch. The Action will automatically deploy your worker.
-
-#### Option B: Manual Deployment
+### 1. Install dependencies and create storage
 
 ```bash
-npm install
-npx wrangler deploy
+npm ci
+npx wrangler kv namespace create DB
+npx wrangler d1 create rss-feed-bot-db
 ```
 
-### 3. Environment Secrets
+Copy the returned IDs into `wrangler.toml`:
 
-After deployment, configure the secrets in Cloudflare:
+- Replace `TODO_REPLACE_WITH_YOUR_KV_ID` and `TODO_REPLACE_WITH_YOUR_KV_PREVIEW_ID` with the KV namespace ID. A separate preview namespace is recommended, but the same ID works for a simple setup.
+- Replace `TODO_REPLACE_WITH_YOUR_D1_ID` with the D1 database UUID. Keep the binding names `DB` and `SQL`; the application expects them.
 
-1.  Go to **Cloudflare Dashboard** > **Workers & Pages** > **Overview** > Select `rss-feed-bot`.
-2.  Go to **Settings** > **Variables and Secrets**.
-3.  Add the following secrets:
-    *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token.
-    *   (Optional) `RSS_BASE_URL`: Defaults to `https://rsshub.app`. Supports host-only or base path. Legacy full-route values (like `/youtube/user`) are auto-normalized.
-
-### 4. Setup Webhook (Crucial!)
-
-For the bot to reply to commands, you must tell Telegram where your Worker is located.
-
-1.  Find your Worker URL (e.g., `https://rss-feed-bot.your-subdomain.workers.dev`).
-2.  Run this command in your browser or terminal:
+Apply the checked-in D1 migrations before starting the Worker:
 
 ```bash
-curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>"
+npm run db:migrate:remote
 ```
 
-*Replace `<YOUR_BOT_TOKEN>` and `<YOUR_WORKER_URL>` with your actual values.*
+For local D1 development, use `npm run db:migrate:local`.
+
+### 2. Configure Worker secrets and optional settings
+
+These two secrets are required:
+
+```bash
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+```
+
+`TELEGRAM_WEBHOOK_SECRET` must be 1-256 characters using only letters, digits, `_`, and `-`. It must exactly match the `secret_token` passed to Telegram in the webhook step below.
+
+Optional Worker variables or secrets:
+
+| Name | Purpose |
+| --- | --- |
+| `RSS_BASE_URL` | RSSHub base URL; defaults to `https://rsshub.app`. A base path is supported. |
+| `ADMIN_USER_IDS` | Comma-separated Telegram user IDs allowed to run management commands. When set, this is the explicit allowlist. |
+| `TELEGRAM_BOT_USERNAME` | Bot username without `@`, used to validate commands such as `/add@my_bot`. |
+| `ALLOWED_FEED_HOSTS` | Comma-separated exact hosts or wildcard entries such as `*.example.com`; include the RSSHub host when using X/YouTube routes. |
+| `FEED_TIMEOUT_MS` | Feed request timeout; default `10000`. |
+| `MAX_FEED_BYTES` | Maximum feed response size; default `1048576`. |
+| `MAX_ITEMS_PER_FEED` | Maximum parsed items per feed and poll; default `20`. |
+| `MAX_FEEDS_PER_RUN` | Maximum distinct feeds fetched per scheduled run; default `3`. |
+| `MAX_TELEGRAM_SENDS_PER_RUN` | Maximum outbox sends per scheduled run; default `35`. |
+| `MAX_DELIVERY_ATTEMPTS` | Maximum Telegram delivery attempts before an outbox row becomes dead; default `10`. |
+| `SENT_HISTORY_LIMIT` | Maximum seen-item keys retained per feed; default `2000`. |
+
+With up to three redirects, one feed can consume four external requests. The defaults therefore budget `3 × 4 + 35 = 47` external requests per scheduled run, leaving a small margin under the Workers Free limit of 50. Check the current Cloudflare plan and subrequest limits before increasing either cap.
+
+You can set these in **Workers & Pages > rss-feed-bot > Settings > Variables and Secrets**, or with `wrangler secret put <NAME>`.
+
+### 3. Deploy
+
+#### GitHub Actions
+
+Add these repository secrets under **Settings > Secrets and variables > Actions**:
+
+- `CLOUDFLARE_API_TOKEN`: an account token allowed to edit Workers Scripts and D1.
+- `CLOUDFLARE_ACCOUNT_ID`: the target Cloudflare account.
+- `TELEGRAM_BOT_TOKEN`: the token from BotFather.
+- `TELEGRAM_WEBHOOK_SECRET`: the same value used as Telegram's `secret_token`.
+- `KV_ID`: the production KV namespace ID.
+- `D1_ID`: the production D1 database UUID.
+
+The deployment workflow runs its verification suite, applies remote D1 migrations, and deploys. Migrations run before the Worker is published; future schema changes must remain backward compatible and use an expand/contract rollout. It is triggered only by:
+
+- a manual `workflow_dispatch` run;
+- pushing a tag matching `v*`; or
+- merging a pull request into `master`.
+
+A normal push to `main` or `master` does not trigger this workflow.
+
+#### Manual deployment
+
+After replacing the IDs in `wrangler.toml` and authenticating Wrangler, run:
+
+```bash
+npm ci
+npm test
+npm run check
+npm run db:migrate:remote
+npm run deploy
+```
+
+Then set the required Worker secrets if you have not done so already. Run migrations before every deployment that introduces a new file under `migrations/`.
+
+### 4. Register the authenticated Telegram webhook
+
+Find the deployed Worker URL, then register it with the same secret stored as `TELEGRAM_WEBHOOK_SECRET`:
+
+```bash
+curl --request POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
+  --data-urlencode "url=https://rss-feed-bot.<YOUR_SUBDOMAIN>.workers.dev" \
+  --data-urlencode "secret_token=<YOUR_TELEGRAM_WEBHOOK_SECRET>" \
+  --data-urlencode 'allowed_updates=["message","callback_query"]'
+```
+
+Telegram will send this value in `X-Telegram-Bot-Api-Secret-Token`; requests without the matching header are rejected.
+
+## Authorization and Feed URL Security
+
+- Management commands are `/add`, `/del`, `/remove`, `/set_forward`, `/del_forward`, and `/forward_to`.
+- If `ADMIN_USER_IDS` is set, only users in that allowlist may run management commands; the allowlist is also explicit global authorization for cross-chat forwarding changes.
+- Without an allowlist, a private chat is managed only by its owner. In groups, the sender must be a Telegram creator or administrator. For `/set_forward` or `/forward_to` targeting a different chat, the sender must also administer the target chat (same-chat and self private-chat targets are exempt). Make the bot a group administrator so `getChatMember` can reliably verify other users; failed verification denies the command.
+- Feed validation rejects non-HTTP(S) schemes, credentials, localhost, and private IP literals. `ALLOWED_FEED_HOSTS` should be set when users may submit arbitrary URLs.
+- RSS subscriptions use a hostname-only safe display name; URL paths, query values, fragments, and embedded credentials are never shown in `/list` or notification source labels.
+- The initial URL and every redirect target are checked against the same host allowlist and private-literal rules. The application still cannot verify hostname DNS resolution, so a strict SSRF boundary also needs controlled DNS/egress policy.
 
 ## Usage
 
@@ -94,20 +149,25 @@ Add the bot to your Group or Supergroup.
 
 *   **Remove Subscription**:
     ```text
+    /del #<subscription_id>
     /del <name>
     /del <type> <name>
     ```
-    *Example:*
-    *   `/del elonmusk` (remove all subscriptions named `elonmusk` in current chat/thread)
-    *   `/del x elonmusk` (remove only X subscription)
-    *   `/del youtube elonmusk` (remove only YouTube subscription)
-    *`<type>` supports `rss`, `x`, `youtube`.*
+    Use `/list` to find the subscription ID, then prefer `/del #<subscription_id>` for an exact deletion in the current chat/thread.
+
+    The name-based forms are retained for compatibility, but they delete only when exactly one subscription matches. If names are duplicated, the bot refuses the deletion and lists the matching IDs so you can retry with `/del #<subscription_id>`.
+
+    *Examples:*
+    *   `/del #42` (recommended; remove exactly subscription `42`)
+    *   `/del elonmusk` (works only when the name is unique in the current chat/thread)
+    *   `/del x elonmusk` (works only when one X subscription matches)
+    *`<type>` supports `rss`, `x`, and `youtube`.*
 
 *   **List Subscriptions**:
     ```text
     /list
     ```
-    *Output format:* `- [type] channel_name` (e.g. `- [x] elonmusk`)
+    *Output format:* `#<subscription_id> [type] safe_name` (for example, `#42 [rss] example.com`). RSS safe names contain only the hostname; URL paths and embedded credentials are never displayed.
 
 *   **Forwarding Settings**:
     Configure message forwarding to another channel/group.
@@ -147,10 +207,27 @@ Add the bot to your Group or Supergroup.
     /help
     ```
 
-## How it Works
+## Architecture and State
 
-1.  **Interactive**: When you send a command, Telegram pushes the update to the Worker (Webhook), which updates the subscription list in KV.
-2.  **Scheduled**: Every 15 minutes (configurable in `wrangler.toml`), the Worker wakes up, checks RSS feeds for all subscriptions, and sends alerts for new updates.
+- `index.js`: Worker composition root for HTTP/webhook validation, update deduplication, and scheduled events.
+- `src/commands.js`: command parsing, authorization, subscription management, forwarding configuration, and callback sessions.
+- `src/poller.js`: feed rotation, seen-item detection, forward-target resolution, outbox enqueueing, and bounded delivery draining.
+- `src/feeds.js`: URL validation, bounded HTTP fetches, RSS/Atom parsing, RSSHub URL construction, and item fingerprints.
+- `src/telegram.js`: HTML-safe rendering and structured Telegram API results without in-request sleeping.
+- `src/storage.js`: parameterized D1 access, legacy migration, webhook claims, delivery state, and retention cleanup.
+
+### Storage ownership
+
+- **D1 (`SQL`)** owns `subscriptions`, `processed_updates`, `operational_leases`, and `deliveries`. The operational lease prevents overlapping scheduled runs from draining the same queue concurrently. Each item/target pair has its own outbox row, so partial Telegram failures can be retried without losing successful targets.
+- **KV (`DB`)** stores bounded per-feed seen history, forwarding configuration, short-lived forwarding sessions, and the polling cursor.
+- A legacy KV `subscriptions` array is copied into D1 automatically on the first invocation after migrations are applied. The import and migration marker are committed together, and the old KV value is intentionally retained for rollback/audit; remove it manually only after verifying D1.
+- Delivery is at-least-once: if the Worker crashes after Telegram accepts a message but before D1 records it as sent, a later retry can deliver that message again.
+
+### Runtime flow
+
+1. Telegram sends an authenticated webhook. `index.js` claims its `update_id` in D1, then delegates the command or callback.
+2. Every 15 minutes, the scheduled handler acquires the D1 operational lease, rotates feed order, and fetches up to `MAX_FEEDS_PER_RUN` feeds before advancing the cursor by the selected count.
+3. The poller drains up to `MAX_TELEGRAM_SENDS_PER_RUN` due deliveries. Successful targets are marked sent; retryable errors use persisted backoff until `MAX_DELIVERY_ATTEMPTS`, permanent or exhausted failures become dead rows, and a Telegram 429 stops the current drain.
 
 ## License
 

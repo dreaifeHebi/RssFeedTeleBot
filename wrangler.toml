@@ -1,6 +1,6 @@
 name = "rss-feed-bot"
 main = "index.js"
-compatibility_date = "2024-02-04"
+compatibility_date = "2026-07-17"
 compatibility_flags = ["nodejs_compat"]
 
 [triggers]
@@ -8,5 +8,11 @@ crons = ["*/15 * * * *"]
 
 [[kv_namespaces]]
 binding = "DB"
-id = "TODO_REPLACE_WITH_YOUR_KV_ID"
-preview_id = "TODO_REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+id = "b2585c40b20a4a0a915fd3cd0f8e7f60"
+preview_id = "6fcf4c1895ab4655ba65f10a7b99d1bb"
+
+[[d1_databases]]
+binding = "SQL"
+database_name = "rss-feed-bot-db"
+database_id = "39259933-3a54-4a0b-ba25-dd5edea97bcd"
+migrations_dir = "migrations"

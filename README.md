@@ -18,7 +18,7 @@ A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTub
 
 1. **Cloudflare account**: [Sign up here](https://dash.cloudflare.com/sign-up).
 2. **Telegram bot token**: Get one from [@BotFather](https://t.me/BotFather).
-3. **Node.js 20+** and npm for local setup.
+3. **Node.js 22+** and npm for local setup.
 4. **GitHub account** only if you use the included deployment workflow.
 
 ## Setup Guide

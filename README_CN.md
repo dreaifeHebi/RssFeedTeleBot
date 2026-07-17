@@ -18,7 +18,7 @@
 
 1. **Cloudflare 账号**: [注册地址](https://dash.cloudflare.com/sign-up)。
 2. **Telegram Bot Token**: 通过 [@BotFather](https://t.me/BotFather) 获取。
-3. **Node.js 20+** 和 npm，用于本地配置。
+3. **Node.js 22+** 和 npm，用于本地配置。
 4. **GitHub 账号**: 仅在使用仓库自带部署工作流时需要。
 
 ## 设置指南

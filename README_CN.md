@@ -18,7 +18,7 @@
 
 1. **Cloudflare 账号**: [注册地址](https://dash.cloudflare.com/sign-up)。
 2. **Telegram Bot Token**: 通过 [@BotFather](https://t.me/BotFather) 获取。
-3. **Node.js 22+** 和 npm，用于本地配置。
+3. **Node.js 22.13+** 和 npm，用于本地配置。
 4. **GitHub 账号**: 仅在使用仓库自带部署工作流时需要。
 
 ## 设置指南
@@ -153,7 +153,7 @@ Telegram 会把该值放入 `X-Telegram-Bot-Api-Secret-Token` 请求头；请求
 
 ## 权限与 Feed URL 安全
 
-- 管理命令包括 `/add`、`/del`、`/remove`、`/set_forward`、`/del_forward` 和 `/forward_to`。
+- 管理命令包括 `/start`、`/menu`、`/add`、`/del`、`/remove`、`/set_forward`、`/del_forward` 和 `/forward_to`；菜单中的 Callback 和后续文本输入也会重新校验权限。
 - 设置 `ADMIN_USER_IDS` 后，只有白名单用户可以执行管理命令；该白名单也视为跨聊天转发配置的全局明确授权。
 - 未设置白名单时，私聊仅允许会话所有者管理；群组中发送者必须是 Telegram 群主或管理员。`/set_forward` 或 `/forward_to` 指向不同聊天时，发送者还必须是目标聊天的管理员（同一聊天及本人私聊目标除外）。应将机器人设为群管理员，以便 `getChatMember` 可靠校验其他用户；校验失败时命令会被拒绝。
 - Feed 校验会拒绝非 HTTP(S) 协议、内嵌凭据、localhost 和私有 IP 字面量。允许用户提交任意 URL 时，应配置 `ALLOWED_FEED_HOSTS`。
@@ -163,6 +163,22 @@ Telegram 会把该值放入 `X-Telegram-Bot-Api-Secret-Token` 请求头；请求
 ## 使用方法
 
 将机器人拉入你的群组或 Supergroup。
+
+### 推荐：菜单式管理
+
+发送 `/menu` 打开主菜单，可以：
+
+- 选择 RSS、X 或 YouTube 后，直接回复 URL/用户名来添加订阅；
+- 分页查看当前聊天或 Topic 的订阅，进入详情后确认删除；
+- 为每条订阅分别管理转发目标、源会话投递与默认规则继承，也可停止继承并改为仅源会话；
+- 输入目标 Chat/Topic 后，从分页列表选择要复制的订阅；
+- 查看当前 Chat ID、Topic ID 和帮助。
+
+输入会话默认 10 分钟失效，菜单默认 1 小时失效，并绑定发起用户、聊天和
+Topic。在群聊中应直接回复机器人的输入提示；发送 `/cancel` 可取消当前输入。
+RSS 名称仍只显示 hostname，不显示 URL path、query 或凭据。
+
+下面的命令继续作为快捷方式保留。
 
 *   **添加订阅**:
     ```text
@@ -197,8 +213,8 @@ Telegram 会把该值放入 `X-Telegram-Bot-Api-Secret-Token` 请求头；请求
     ```
     *输出格式:* `#<subscription_id> [type] safe_name`（例如 `#42 [rss] example.com`）。RSS 的安全名称仅包含 hostname，不会展示 URL path 或内嵌凭据。
 
-*   **转发设置**:
-    配置将消息转发到另一个频道/群组。
+*   **聊天/Topic 默认消息转发**:
+    为当前聊天或 Topic 的订阅配置默认消息路由。
     ```text
     /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]
     ```
@@ -218,11 +234,28 @@ Telegram 会把该值放入 `X-Telegram-Bot-Api-Secret-Token` 请求头；请求
     ```
     *   默认为 `topic`。使用 `/del_forward global` 移除全局配置。
 
-*   **转发订阅 (批量复制)**:
+    已经在菜单中建立独立规则的订阅不会受后续 `/set_forward` 或
+    `/del_forward` 影响；在该订阅的转发页面选择“恢复继承聊天规则”后才会重新跟随默认规则。
+
+*   **每条订阅独立消息转发（菜单）**:
+    在 `/menu` 中依次选择“消息转发”与具体订阅。每条订阅可以：
+
+    - 保存最多 10 个目标 Chat/Topic，并单独删除；
+    - 选择“源会话 + 目标”或“仅目标”；
+    - 选择“仅源会话（停止继承）”，单独排除默认转发目标；
+    - 恢复继承当前 Topic/global 默认规则。
+
+    普通的第一次自定义会以该订阅当时有效的旧默认转发效果为起点，再应用新目标，
+    避免意外丢失旧目标或改变 `only_forward`；选择“仅源会话”则会明确停止继承并
+    排除默认目标。不能在没有目标时关闭源投递，也不能在源投递关闭时删除最后一个
+    目标。规则修改只影响未来入队，已有 Outbox 消息不变。
+
+*   **复制订阅（不是消息转发）**:
     允许将当前会话的订阅复制到另一个会话（群组/频道）。
     ```text
     /forward_to <target_chat_id> [target_thread_id]
     ```
+    订阅较多时选择器会自动分页；复制后的两边继续独立管理。
 
 *   **获取会话信息**:
     ```text
@@ -246,8 +279,8 @@ Telegram 会把该值放入 `X-Telegram-Bot-Api-Secret-Token` 请求头；请求
 
 ### 存储职责
 
-- **D1 (`SQL`)** 保存 `subscriptions`、`processed_updates`、`operational_leases` 和 `deliveries`。Operational lease 会阻止重叠定时任务并发消费同一队列。每个条目/目标组合都有独立 Outbox 记录，因此 Telegram 部分投递失败时可以单独重试，不会丢失已成功目标。
-- **KV (`DB`)** 保存有界的 Feed 已见历史、转发配置、短期转发 Session 和轮询游标。
+- **D1 (`SQL`)** 保存 `subscriptions`、`subscription_routing_settings`、`subscription_forward_targets`、`processed_updates`、`operational_leases` 和 `deliveries`。每订阅独立规则和目标使用稳定订阅 ID 关联；每个条目/最终目标组合都有独立 Outbox 记录，可按目标单独重试。
+- **KV (`DB`)** 保存有界的 Feed 已见历史、旧的 chat/topic 默认转发配置、短期菜单/输入/复制 Session 和轮询游标。
 - 应用 D1 迁移后，首次运行会自动把旧 KV `subscriptions` 数组复制到 D1。导入与迁移标记会一起提交，旧 KV 值会有意保留用于回滚/审计；确认 D1 数据正确后再手动删除。
 - 投递语义为 at-least-once：若 Telegram 已接受消息、但 Worker 在 D1 标记 sent 前崩溃，后续重试可能再次投递同一消息。
 

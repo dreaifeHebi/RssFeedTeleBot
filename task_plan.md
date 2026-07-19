@@ -163,3 +163,92 @@ Complete — patch, documentation, security review, tests, and Wrangler dry-run 
 - Wrangler 4.111.0 dry-run: passed, 265.64 KiB / gzip 63.67 KiB.
 - Dry-run artifact includes `index.js.map`.
 - Production deploy and delivery replay were not performed.
+
+---
+
+# Interaction Improvement Plan: RSS and independent forwarding management (2026-07-20)
+
+## Goal
+
+在保留现有命令与权限边界的前提下，为 Bot 增加菜单优先的订阅管理体验，并支持每条订阅拥有可独立增删的多个消息转发目标。
+
+## Current Phase
+
+Complete — implementation, documentation, review, tests, and Worker dry-run finished; production is not deployed.
+
+## Phases
+
+- [x] U1：盘点现有命令、Callback、存储、Poller 与测试基线（complete）
+- [x] U2：确定菜单、会话状态、独立转发模型与兼容策略（complete）
+- [x] U3：实现 D1 增量迁移、存储 API 与 Poller 独立路由（complete）
+- [x] U4：实现菜单式添加、列表、删除确认及转发管理（complete）
+- [x] U5：补齐中英文文档与自动化测试，完成全量验证（complete）
+
+## Compatibility and Safety Constraints
+
+- 继续支持 /add、/list、/del、/set_forward、/del_forward 和 /forward_to。
+- 明确区分“消息转发规则”和“复制订阅”。
+- 新表采用 additive migration；没有独立规则的订阅继续继承现有 topic/global KV 转发配置。
+- 所有 Callback 与输入会话必须绑定发起用户、源 chat 和 thread，并在写入时重新校验权限。
+- 禁止关闭源投递且没有任何目标，避免消息静默丢失。
+- 规则修改仅影响未来入队，不重写或重放已有 delivery。
+- 不提交、不推送、不部署生产。
+
+## Decisions
+
+| Decision | Rationale |
+|---|---|
+| 独立转发存入 D1，而非 KV 数组 | 支持每订阅多目标、精确删除和参数化授权，避免 KV 并发覆盖与枚举困难 |
+| 没有独立 settings 行时继承旧 KV | 保持升级前行为不变，无需迁移现有配置 |
+| 菜单使用短 session token + KV TTL | Callback data 保持短小，状态可绑定用户/chat/thread，适合分步输入 |
+| 旧命令继续作为快捷方式 | 降低现有用户迁移成本 |
+
+## Errors Encountered
+| source-only 三 hunk 补丁末段函数边界行号偏移 7 行 | 1 | Git 原子拒绝无部分写入；用 rg 获取当前函数行号后逐段应用 |
+| source-only 两 hunk 补丁第二处仍因上下文起始行不匹配 | 1 | Git 原子拒绝无部分写入；改用 nl 获取插入点并执行 zero-context 插入 |
+| ForceReply 三 hunk 补丁最后一处输入校验上下文未匹配 | 1 | Git 原子拒绝无部分写入；先应用 prompt 创建段，再按更新后精确行号插入消费端保护 |
+| ForceReply 创建段补丁仍使用插入前旧函数坐标 | 1 | Git 原子拒绝无部分写入；核对累计增量后的 nl 行号，改为逐行 zero-context 编辑 |
+| git apply 拒绝精确 ForceReply 单行删除，但 GNU patch dry-run 成功 | 1 | 确认为 git apply 对重度修改文件的偏移匹配问题；后续同样使用路径限定的 unified patch |
+| 首次 GNU patch 合并 ForceReply hunk 的新行计数错误 | 1 | patch 在写入前报 malformed，rg 确认源码无部分变更且无 .orig/.rej；改为单一小 hunk 逐次应用 |
+| prompt 绑定上下文 patch 未匹配并生成 .rej | 1 | 源码未变；经提升权限删除本轮生成的 reject，改用 dry-run 通过的精确 zero-context 补丁 |
+| 双语文档补丁再次在 JavaScript template 中含 Markdown backtick | 1 | 脚本解析前失败、无写入；改用占位符生成 backtick 后重试 |
+| 占位符文档补丁仍残留代码围栏的两个 backtick | 1 | 脚本解析前失败、无写入；将围栏三个字符全部替换为占位符 |
+| 双语文档大补丁中文第二 hunk 上下文未匹配 | 1 | Git 原子拒绝无部分写入；读取精确行号后拆成每个 README 的小补丁 |
+| storage SQL 补丁的 JavaScript template closing backtick 未占位 | 1 | 脚本解析前失败、无写入；改用占位字符生成 backtick |
+| storage 两 hunk patch 仅参数 hunk 应用，SQL guard hunk 失败并生成 .rej | 1 | 立即确认 partial state；删除本轮 reject 后在精确行 389 插入 guard，使 placeholder 与 bind 恢复一致 |
+| storage 测试两 hunk patch 的首段行数与第二 header 不一致 | 1 | patch 报 malformed 且确认无部分写入/残留；拆为参数替换和 SQL 断言两个补丁 |
+| package + lockfile engine 多文件补丁在 lockfile 上下文未匹配 | 1 | Git 原子拒绝无部分写入；拆成两个精确单文件替换 |
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| 首次新建规划文件误覆盖三份已跟踪历史记录 | 1 | 用户明确授权后，以当前 diff 的反向补丁完整恢复 Git 版本；业务代码未受影响 |
+| 内置 apply_patch 因 bwrap loopback RTM_NEWADDR 失败 | 1–3 | 经用户明确授权，仅对本仓库使用带具体内容的提升权限 Git 补丁 |
+| 提升权限调用 apply_patch 仍在内部触发同一 fs sandbox helper 错误 | 1 | 按用户授权改用内容固定、路径限定的 git apply 补丁；每次补丁后单独验证 |
+| storage + poller tests 多文件补丁的 Poller 插入上下文偏移 | 1 | git apply 原子拒绝，确认两文件均未部分写入；拆成单文件补丁并按实际测试名定位 |
+| U3 阶段更新补丁使用了不完整的 @@ hunk header | 1 | Git 在写入前拒绝；改为每个 hunk 都带完整旧/新行范围 |
+| Callback 正则 + 删除过滤多 hunk 补丁首段含无变化上下文而匹配失败 | 1 | 确认原子拒绝无部分写入；移除无效首段并拆分为精确补丁 |
+| 首次 commands/security 定向测试 18/19，复制按钮图标断言仍期望旧 📺 | 1 | 功能与安全测试均通过；更新预期为区分“复制订阅”的新 📋 文案并补菜单测试 |
+| U4→U5 状态补丁连续三次因 header/上下文定位问题被 Git 原子拒绝 | 1–3 | 读取精确行号并改用 zero-context、路径限定的单行替换；前三次均无部分写入 |
+| 首次双语 README 补丁的 JavaScript 模板含未转义 Markdown backtick | 1 | 命令在解析前失败、无写入；后续用占位字符生成 backtick |
+| 中文 README 大上下文补丁首 hunk 未匹配 | 1 | Git 原子拒绝无写入；改为精确行号 zero-context 文档补丁 |
+| 一次 rg 命令在双引号中包含 backtick，shell 尝试执行 SQL/DB | 1 | 仅产生 command-not-found、未写入；后续 shell 正则统一使用单引号 |
+| 记录复审结果时误把内置 apply_patch 标记格式交给 git apply | 1 | Git 在写入前拒绝；改用标准 unified diff，未产生部分写入 |
+| 首次标准补丁调用只定义了 JavaScript 变量但未传入 git apply stdin | 1 | Git 在写入前拒绝；改用带固定内容的 quoted heredoc，未产生部分写入 |
+| commands 多 hunk 交互补丁最后一段因前置分页改动导致行上下文偏移 | 1 | Git 原子拒绝、确认无部分写入；拆分为路由、输入会话和目标处理三个小补丁 |
+| 记录该错误与进展的多文件补丁在 progress 上下文未匹配 | 1 | Git 原子拒绝无部分写入；读取精确行号后改用 zero-context 追加 |
+| 群聊消费端 zero-context guard 插入到既有 if ( 与条件之间 | 1 | node --check 与 commands 测试立即暴露 Unexpected token；替换完整条件块恢复结构 |
+| 新回归测试 zero-context 追加落在上一 test 的尾部断言之前 | 1 | 21 项虽通过但被报告为嵌套 subtests；移动原尾部断言/闭包到新增测试之前后重跑 |
+| GNU patch 成功/模糊匹配后留下两个 .orig 备份 | 1 | git status 发现后，经提升权限仅删除本轮生成的 src/commands.js.orig 与 test/commands.test.js.orig |
+| git apply 再次拒绝重度修改 commands 文件的精确单行替换 | 1 | 无部分写入；改用路径限定、no-backup-if-mismatch 的 GNU unified patch 成功 |
+| stale-input zero-context 插入落在 beginUiInput 函数外 | 1 | npm test 在模块加载时报 ReferenceError；定位顶层 src/commands.js:1108 后移动到函数体首行 |
+| 新增 commands 测试文件结尾多一个空行 | 1 | git diff --check 精确报 test/commands.test.js:1387；删除 EOF 空行后复验 |
+| SQLite cap test zero-context 追加再次落在原测试尾部断言之前 | 1 | 两项逻辑通过但报告为嵌套；移动原 scoped-cleanup 断言/闭包到新 test 之前后复跑 |
+| progress zero-context 追加位于原 in_progress 状态之前 | 1 | 最终审计发现后，将 complete 状态移到 session 标题首部并删除旧状态行 |
+
+## Interaction Final Verification
+
+- npm test: 114/114 passed.
+- npm run check: passed.
+- git diff --check: passed.
+- Wrangler 4.111.0 dry-run: passed, 322.01 KiB / gzip 73.89 KiB.
+- Production migration/deploy, commit, push, and delivery replay were not performed.

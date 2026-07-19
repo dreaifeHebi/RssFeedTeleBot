@@ -13,7 +13,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply SQL --remote"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "dependencies": {
     "fast-xml-parser": "5.10.1"

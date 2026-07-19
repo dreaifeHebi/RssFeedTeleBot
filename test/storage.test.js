@@ -3,20 +3,27 @@ import test from 'node:test';
 
 import {
   acquireOperationalLease,
+  addSubscriptionForwardTarget,
   addSubscription,
   claimUpdate,
   completeUpdate,
   copySubscriptions,
   enqueueDeliveries,
   ensureLegacySubscriptionsMigrated,
+  getSubscriptionRouting,
   getUpdateState,
+  initializeSubscriptionRouting,
   listPendingDeliveries,
+  listSubscriptionsWithRouting,
   listSubscriptions,
   markDeliveryRetry,
   markDeliverySent,
   pruneOperationalState,
   releaseOperationalLease,
   releaseUpdate,
+  removeSubscriptionForwardTarget,
+  resetSubscriptionRouting,
+  setSubscriptionIncludeSource,
   removeSubscriptions
 } from '../src/storage.js';
 
@@ -608,6 +615,266 @@ test('delivery APIs normalize targets and persist retry state per target', async
     true
   );
   assert.deepEqual(SQL.runCalls[1].params, ['dead', 3, 'temporary', 10]);
+});
+
+test('subscription routing APIs map rows and scope every mutation', async () => {
+  const SQL = new FakeD1({
+    all: [
+      {
+        results: [
+          {
+            id: 5,
+            type: 'rss',
+            channel_name: 'example.com',
+            rss_url: 'https://example.com/feed.xml',
+            chat_id: '-100',
+            thread_id: '9',
+            created_at: 100,
+            routing_subscription_id: 5,
+            include_source: 0,
+            routing_created_at: 110,
+            routing_updated_at: 120,
+            target_id: 11,
+            target_chat_id: '-200',
+            target_thread_id: '',
+            target_created_at: 130
+          },
+          {
+            id: 5,
+            type: 'rss',
+            channel_name: 'example.com',
+            rss_url: 'https://example.com/feed.xml',
+            chat_id: '-100',
+            thread_id: '9',
+            created_at: 100,
+            routing_subscription_id: 5,
+            include_source: 0,
+            routing_created_at: 110,
+            routing_updated_at: 120,
+            target_id: 12,
+            target_chat_id: '-201',
+            target_thread_id: '8',
+            target_created_at: 140
+          }
+        ]
+      },
+      {
+        results: [{
+          subscription_id: 6,
+          routing_subscription_id: null,
+          include_source: 1,
+          target_id: null,
+          target_chat_id: null,
+          target_thread_id: null
+        }]
+      }
+    ],
+    batch: [
+      [changed(1), changed(1)],
+      [changed(1), changed(1)]
+    ],
+    run: [changed(1), changed(1)]
+  });
+  const env = { SQL };
+
+  assert.deepEqual(await listSubscriptionsWithRouting(env), [{
+    id: 5,
+    type: 'rss',
+    channelName: 'example.com',
+    rssUrl: 'https://example.com/feed.xml',
+    chatId: '-100',
+    threadId: '9',
+    createdAt: 100,
+    routing: {
+      includeSource: false,
+      createdAt: 110,
+      updatedAt: 120,
+      targets: [
+        { id: 11, chatId: '-200', threadId: null, createdAt: 130 },
+        { id: 12, chatId: '-201', threadId: '8', createdAt: 140 }
+      ]
+    }
+  }]);
+  assert.match(
+    compactSql(SQL.allCalls[0].sql),
+    /FROM subscriptions.*LEFT JOIN subscription_routing_settings.*LEFT JOIN subscription_forward_targets/
+  );
+
+  assert.deepEqual(
+    await getSubscriptionRouting(
+      env,
+      { subscriptionId: 6, chatId: '-100', threadId: null }
+    ),
+    {
+      subscriptionId: 6,
+      independent: false,
+      includeSource: true,
+      targets: []
+    }
+  );
+  assert.deepEqual(SQL.allCalls[1].params, [6, '-100', '']);
+
+  assert.equal(
+    await addSubscriptionForwardTarget(
+      env,
+      { subscriptionId: 5, chatId: '-100', threadId: '9' },
+      { chatId: '-300', threadId: '10' }
+    ),
+    true
+  );
+  assert.match(
+    compactSql(SQL.batchCalls[0][0].sql),
+    /INSERT INTO subscription_routing_settings.*SELECT id, 1/
+  );
+  assert.deepEqual(SQL.batchCalls[0][0].params, [5, '-100', '9']);
+  assert.deepEqual(
+    SQL.batchCalls[0][1].params,
+    ['-300', '10', 5, '-100', '9', 10]
+  );
+  assert.match(
+    compactSql(SQL.batchCalls[0][1].sql),
+    /SELECT COUNT\(\*\) FROM subscription_forward_targets WHERE subscription_id = subscriptions\.id \) < \?/
+  );
+
+  assert.equal(
+    await removeSubscriptionForwardTarget(
+      env,
+      {
+        subscriptionId: 5,
+        targetId: 11,
+        chatId: '-100',
+        threadId: '9'
+      }
+    ),
+    true
+  );
+  assert.deepEqual(
+    SQL.runCalls[0].params,
+    [11, 5, '-100', '9', 5, 5, 11]
+  );
+  assert.match(
+    compactSql(SQL.runCalls[0].sql),
+    /include_source = 1.*sibling\.id <> \?/
+  );
+
+  assert.equal(
+    await setSubscriptionIncludeSource(
+      env,
+      { subscriptionId: 5, chatId: '-100', threadId: '9' },
+      false
+    ),
+    true
+  );
+  assert.deepEqual(SQL.runCalls[1].params, [0, 5, '-100', '9', 0]);
+  assert.match(
+    compactSql(SQL.runCalls[1].sql),
+    /OR EXISTS \( SELECT 1 FROM subscription_forward_targets/
+  );
+
+  assert.equal(
+    await resetSubscriptionRouting(
+      env,
+      { subscriptionId: 5, chatId: '-100', threadId: '9' }
+    ),
+    2
+  );
+  assert.deepEqual(SQL.batchCalls[1][0].params, [5, '-100', '9']);
+  assert.deepEqual(SQL.batchCalls[1][1].params, [5, '-100', '9']);
+});
+
+test('initial routing snapshot is materialized atomically and deduplicates targets', async () => {
+  const SQL = new FakeD1({
+    batch: [[changed(1), changed(1), changed(0)]]
+  });
+  const env = { SQL };
+  const result = await initializeSubscriptionRouting(
+    env,
+    { subscriptionId: 7, chatId: '-100', threadId: '9' },
+    {
+      includeSource: false,
+      targets: [
+        { chatId: '-200', threadId: null },
+        { chatId: '-201', threadId: '8' },
+        { chatId: '-200', threadId: null }
+      ]
+    }
+  );
+
+  assert.deepEqual(result, { created: true, targetsAdded: 1 });
+  assert.equal(SQL.batchCalls[0].length, 3);
+  assert.deepEqual(SQL.batchCalls[0][0].params, [0, 7, '-100', '9']);
+  assert.deepEqual(
+    SQL.batchCalls[0][1].params,
+    ['-200', '', 7, '-100', '9', 10]
+  );
+  assert.deepEqual(
+    SQL.batchCalls[0][2].params,
+    ['-201', '8', 7, '-100', '9', 10]
+  );
+  assert.match(
+    compactSql(SQL.batchCalls[0][1].sql),
+    /INNER JOIN subscription_routing_settings.*subscriptions\.id = \?.*subscriptions\.chat_id = \?.*subscriptions\.thread_id = \?/
+  );
+  assert.match(
+    compactSql(SQL.batchCalls[0][1].sql),
+    /SELECT COUNT\(\*\).*subscription_forward_targets.*< \?/
+  );
+
+
+  const rejected = new FakeD1();
+  await assert.rejects(
+    initializeSubscriptionRouting(
+      { SQL: rejected },
+      { subscriptionId: 7, chatId: '-100', threadId: '9' },
+      { includeSource: false, targets: [] }
+    ),
+    /keep the source or contain at least one target/
+  );
+  assert.equal(rejected.batchCalls.length, 0);
+});
+
+test('initial routing snapshot rejects more than ten unique targets before D1 access', async () => {
+  const SQL = new FakeD1();
+  const targets = Array.from({ length: 11 }, (_, index) => ({
+    chatId: String(-200 - index),
+    threadId: null
+  }));
+
+  await assert.rejects(
+    initializeSubscriptionRouting(
+      { SQL },
+      { subscriptionId: 7, chatId: '-100', threadId: '9' },
+      { includeSource: true, targets }
+    ),
+    /routing\.targets must contain at most 10 unique targets/
+  );
+  assert.equal(SQL.batchCalls.length, 0);
+});
+
+test('subscription routing rejects unsafe identifiers and booleans', async () => {
+  const env = { SQL: new FakeD1() };
+  await assert.rejects(
+    getSubscriptionRouting(
+      env,
+      { subscriptionId: '../1', chatId: '1', threadId: null }
+    ),
+    /positive safe integer/
+  );
+  await assert.rejects(
+    removeSubscriptionForwardTarget(
+      env,
+      { subscriptionId: 1, targetId: 0, chatId: '1', threadId: null }
+    ),
+    /targetId must be a positive safe integer/
+  );
+  await assert.rejects(
+    setSubscriptionIncludeSource(
+      env,
+      { subscriptionId: 1, chatId: '1', threadId: null },
+      'false'
+    ),
+    /includeSource must be a boolean/
+  );
 });
 
 function snapshot(statement) {

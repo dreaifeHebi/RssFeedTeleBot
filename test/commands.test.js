@@ -51,7 +51,7 @@ function makeHarness(overrides = {}) {
   const services = {
     async sendTelegramMessage(token, chatId, threadId, text, replyMarkup, options) {
       messages.push({ token, chatId, threadId, text, replyMarkup, options });
-      return { ok: true };
+      return { ok: true, result: { message_id: messages.length } };
     },
     async answerCallbackQuery(token, callbackQueryId, text, options) {
       answers.push({ token, callbackQueryId, text, options });
@@ -542,7 +542,7 @@ test('forward sessions bind chat, thread, and initiating user and copy once', as
   assert.equal(stored.subMap[0].channelName, 'feeds.example');
   assert.doesNotMatch(JSON.stringify(stored.subMap[0]), /legacy\/feeds/);
   assert.equal(harness.messages[0].replyMarkup.inline_keyboard[1][0].text,
-    '📺 [rss] feeds.example');
+    '📋 [rss] feeds.example');
   assert.doesNotMatch(
     harness.messages[0].replyMarkup.inline_keyboard[1][0].text,
     /secret-token/
@@ -669,6 +669,303 @@ test('a valid forwarding callback is consumed when rows already exist', async ()
   assert.match(harness.answers[0].text, /already exist/);
 });
 
+test('menu session is scoped, active, and renders bounded navigation callbacks', async () => {
+  const kv = makeKv();
+  const subscriptions = [{
+    id: 1,
+    type: 'rss',
+    channelName: 'hidden/path',
+    rssUrl: 'https://feeds.example/hidden/path?token=secret',
+    chatId: '7',
+    threadId: null
+  }];
+  const harness = makeHarness({
+    randomUUID() {
+      return 'menu_1';
+    },
+    async listSubscriptions() {
+      return subscriptions;
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/menu'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  const session = JSON.parse(kv.values.get('ui_session:menu_1'));
+  assert.equal(session.sourceChatId, '7');
+  assert.equal(session.sourceThreadId, null);
+  assert.equal(session.initiatorUserId, '7');
+  assert.equal(kv.values.get('ui_active:7:_:7'), 'menu_1');
+  assert.match(harness.messages[0].text, /RSS 订阅管理/);
+  const callbacks = harness.messages[0].replyMarkup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data);
+  assert.equal(callbacks.includes('ui:menu_1:l:0'), true);
+  for (const callback of callbacks) {
+    assert.ok(new TextEncoder().encode(callback).length <= 64);
+  }
+
+  await handleCallback(
+    {
+      id: 'wrong-user',
+      data: 'ui:menu_1:l:0',
+      from: { id: '8' },
+      message: { chat: { id: '7', type: 'private' } }
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.match(harness.answers.at(-1).text, /菜单已过期/);
+
+  await handleCallback(
+    {
+      id: 'right-user',
+      data: 'ui:menu_1:l:0',
+      from: { id: '7' },
+      message: { chat: { id: '7', type: 'private' } }
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.match(harness.messages.at(-1).text, /管理订阅/);
+  assert.match(
+    harness.messages.at(-1).replyMarkup.inline_keyboard[0][0].text,
+    /\[RSS\] feeds\.example/
+  );
+  assert.doesNotMatch(harness.messages.at(-1).text, /hidden|secret/);
+});
+
+test('menu RSS input keeps invalid sessions and consumes successful additions', async () => {
+  const kv = makeKv();
+  const added = [];
+  const harness = makeHarness({
+    randomUUID() {
+      return 'menu_add';
+    },
+    async addSubscription(env, subscription) {
+      added.push(subscription);
+      return true;
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/menu'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  await handleCallback(
+    {
+      id: 'add-rss',
+      data: 'ui:menu_add:at:r',
+      from: { id: '7' },
+      message: { chat: { id: '7', type: 'private' } }
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  const inputKey = 'ui_input:7:_:7';
+  assert.equal(JSON.parse(kv.values.get(inputKey)).subscriptionType, 'rss');
+
+  await handleMessage(
+    makeMessage('not-a-feed-url'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.equal(kv.values.has(inputKey), true);
+  assert.equal(added.length, 0);
+
+  await handleMessage(
+    makeMessage('https://feeds.example/private/feed.xml?token=secret'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.equal(kv.values.has(inputKey), false);
+  assert.equal(added.length, 1);
+  assert.equal(added[0].channelName, 'feeds.example');
+  assert.equal(added[0].chatId, '7');
+  assert.doesNotMatch(harness.messages.at(-1).text, /token=secret/);
+});
+
+test('menu subscription deletion requires confirmation and stays source scoped', async () => {
+  const kv = makeKv();
+  const removed = [];
+  const subscription = {
+    id: 42,
+    type: 'rss',
+    channelName: 'feeds.example',
+    rssUrl: 'https://feeds.example/rss',
+    chatId: '-100',
+    threadId: '9'
+  };
+  const harness = makeHarness({
+    randomUUID() {
+      return 'menu_delete';
+    },
+    async listSubscriptions() {
+      return [subscription];
+    },
+    async removeSubscriptions(env, filter) {
+      removed.push(filter);
+      return 1;
+    },
+    async getSubscriptionRouting() {
+      return {
+        subscriptionId: 42,
+        independent: false,
+        includeSource: true,
+        targets: []
+      };
+    }
+  });
+  const messageOverrides = {
+    chat: { id: '-100', type: 'supergroup' },
+    from: { id: '7' },
+    message_thread_id: '9'
+  };
+
+  await handleMessage(
+    makeMessage('/menu', messageOverrides),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  const callbackBase = {
+    from: { id: '7' },
+    message: {
+      chat: { id: '-100', type: 'supergroup' },
+      message_thread_id: '9'
+    }
+  };
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'delete-confirm',
+      data: 'ui:menu_delete:dc:42:0'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.equal(removed.length, 0);
+  assert.match(harness.messages.at(-1).text, /确认删除订阅/);
+
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'delete-execute',
+      data: 'ui:menu_delete:dx:42:0'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.deepEqual(removed, [{
+    id: 42,
+    chatId: '-100',
+    threadId: '9'
+  }]);
+});
+
+test('first independent target snapshots inherited only-forward behavior', async () => {
+  const kv = makeKv();
+  kv.values.set('forward_config:7', JSON.stringify({
+    targetChatId: '-200',
+    targetThreadId: null,
+    onlyForward: true,
+    isGlobal: true
+  }));
+  let independent = false;
+  let storedSnapshot;
+  const subscription = {
+    id: 9,
+    type: 'rss',
+    channelName: 'feeds.example',
+    rssUrl: 'https://feeds.example/rss',
+    chatId: '7',
+    threadId: null
+  };
+  const harness = makeHarness({
+    randomUUID() {
+      return 'menu_route';
+    },
+    async listSubscriptions() {
+      return [subscription];
+    },
+    async getSubscriptionRouting() {
+      return independent
+        ? {
+            subscriptionId: 9,
+            independent: true,
+            includeSource: storedSnapshot.includeSource,
+            targets: storedSnapshot.targets.map((target, index) => ({
+              id: index + 1,
+              ...target
+            }))
+          }
+        : {
+            subscriptionId: 9,
+            independent: false,
+            includeSource: true,
+            targets: []
+          };
+    },
+    async initializeSubscriptionRouting(env, scope, snapshot) {
+      assert.deepEqual(scope, {
+        subscriptionId: 9,
+        chatId: '7',
+        threadId: null
+      });
+      storedSnapshot = structuredClone(snapshot);
+      independent = true;
+      return { created: true, targetsAdded: snapshot.targets.length };
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/menu'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  await handleCallback(
+    {
+      id: 'route-add',
+      data: 'ui:menu_route:fa:9',
+      from: { id: '7' },
+      message: { chat: { id: '7', type: 'private' } }
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  await handleMessage(
+    makeMessage('-300 8'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  assert.deepEqual(storedSnapshot, {
+    includeSource: false,
+    targets: [
+      { chatId: '-200', threadId: null },
+      { chatId: '-300', threadId: '8' }
+    ]
+  });
+  assert.equal(kv.values.has('ui_input:7:_:7'), false);
+  assert.match(harness.messages.at(-2).text, /已添加独立转发目标/);
+});
+
 
 test('cross-chat commands fail closed unless the initiator manages the target', async () => {
   const kv = makeKv();
@@ -756,9 +1053,334 @@ test('social names allow common handle characters and reject unsafe shapes', asy
     config,
     harness.services
   );
-
   assert.equal(added.length, 1);
   assert.match(harness.messages.at(-3).text, /one value without whitespace/);
   assert.match(harness.messages.at(-2).text, /invalid characters/);
   assert.match(harness.messages.at(-1).text, /too long/);
+});
+
+test('forward copy selector paginates without consuming the session', async () => {
+  const kv = makeKv();
+  const copies = [];
+  const subscriptions = Array.from({ length: 18 }, (_, index) => ({
+    id: index + 1,
+    type: 'x',
+    channelName: 'feed-' + (index + 1),
+    rssUrl: 'https://rsshub.example/twitter/user/feed-' + (index + 1),
+    chatId: '7',
+    threadId: null
+  }));
+  const harness = makeHarness({
+    randomUUID() {
+      return 'copy_pages';
+    },
+    async listSubscriptions() {
+      return subscriptions;
+    },
+    async copySubscriptions(env, selected, chatId, threadId) {
+      copies.push({ selected, chatId, threadId });
+      return selected.length;
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/forward_to -200'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  const firstCallbacks = harness.messages.at(-1).replyMarkup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data);
+  assert.deepEqual(
+    firstCallbacks.filter((value) => /^fwd:copy_pages:\d+$/.test(value)),
+    Array.from({ length: 8 }, (_, index) => 'fwd:copy_pages:' + index)
+  );
+  assert.equal(firstCallbacks.includes('fwd:copy_pages:P1'), true);
+
+  const callbackBase = {
+    from: { id: '7' },
+    message: { chat: { id: '7', type: 'private' } }
+  };
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'copy-page-2',
+      data: 'fwd:copy_pages:P1'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  assert.equal(kv.values.has('fwd_session:copy_pages'), true);
+  assert.match(harness.answers.at(-1).text, /已翻页/);
+  assert.match(harness.messages.at(-1).text, /第 2\/3 页/);
+  const secondCallbacks = harness.messages.at(-1).replyMarkup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data);
+  assert.deepEqual(
+    secondCallbacks.filter((value) => /^fwd:copy_pages:\d+$/.test(value)),
+    Array.from({ length: 8 }, (_, index) => 'fwd:copy_pages:' + (index + 8))
+  );
+
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'copy-one',
+      data: 'fwd:copy_pages:9'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  assert.equal(kv.values.has('fwd_session:copy_pages'), false);
+  assert.deepEqual(copies, [{
+    selected: [{
+      type: 'x',
+      channelName: 'feed-10',
+      rssUrl: 'https://rsshub.example/twitter/user/feed-10'
+    }],
+    chatId: '-200',
+    threadId: null
+  }]);
+});
+
+test('group menu input binds ForceReply to its prompt message', async () => {
+  const kv = makeKv();
+  const added = [];
+  const harness = makeHarness({
+    randomUUID() {
+      return 'group_input';
+    },
+    async addSubscription(env, subscription) {
+      added.push(subscription);
+      return true;
+    }
+  });
+  const group = {
+    chat: { id: '-100', type: 'supergroup' },
+    from: { id: '7' }
+  };
+
+  await handleMessage(
+    makeMessage('/menu', group),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  await handleCallback(
+    {
+      id: 'group-add-rss',
+      data: 'ui:group_input:at:r',
+      from: { id: '7' },
+      message: { chat: { id: '-100', type: 'supergroup' } }
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  const prompt = harness.messages.at(-1);
+  assert.equal(prompt.replyMarkup.force_reply, true);
+  assert.equal(Object.hasOwn(prompt.replyMarkup, 'selective'), false);
+  const inputKey = 'ui_input:-100:_:7';
+  const input = JSON.parse(kv.values.get(inputKey));
+  assert.equal(input.promptMessageId, '2');
+
+  await handleMessage(
+    makeMessage('https://feeds.example/no-reply.xml', group),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.equal(added.length, 0);
+  assert.equal(kv.values.has(inputKey), true);
+
+  await handleMessage(
+    makeMessage('https://feeds.example/replied.xml', {
+      ...group,
+      reply_to_message: { message_id: 2 }
+    }),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.equal(added.length, 1);
+  assert.equal(kv.values.has(inputKey), false);
+});
+
+test('adding an inherited target keeps the subscription inherited', async () => {
+  const kv = makeKv();
+  kv.values.set('forward_config:7', JSON.stringify({
+    targetChatId: '-200',
+    targetThreadId: null,
+    onlyForward: false,
+    isGlobal: true
+  }));
+  let initializeCalls = 0;
+  const subscription = {
+    id: 9,
+    type: 'rss',
+    channelName: 'feeds.example',
+    rssUrl: 'https://feeds.example/rss',
+    chatId: '7',
+    threadId: null
+  };
+  const harness = makeHarness({
+    randomUUID() {
+      return 'inherit_duplicate';
+    },
+    async listSubscriptions() {
+      return [subscription];
+    },
+    async getSubscriptionRouting() {
+      return {
+        subscriptionId: 9,
+        independent: false,
+        includeSource: true,
+        targets: []
+      };
+    },
+    async initializeSubscriptionRouting() {
+      initializeCalls += 1;
+      return { created: true, targetsAdded: 1 };
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/menu'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  await handleCallback(
+    {
+      id: 'inherit-add',
+      data: 'ui:inherit_duplicate:fa:9',
+      from: { id: '7' },
+      message: { chat: { id: '7', type: 'private' } }
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  await handleMessage(
+    makeMessage('-200'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+
+  assert.equal(initializeCalls, 0);
+  assert.equal(kv.values.has('ui_input:7:_:7'), false);
+  assert.equal(
+    harness.messages.some((message) => /仍保持继承/.test(message.text)),
+    true
+  );
+});
+
+test('an inherited subscription can opt into source-only routing', async () => {
+  const kv = makeKv();
+  kv.values.set('forward_config:7', JSON.stringify({
+    targetChatId: '-200',
+    targetThreadId: null,
+    onlyForward: true,
+    isGlobal: true
+  }));
+  let independent = false;
+  let storedSnapshot = null;
+  let setIncludeSourceCalls = 0;
+  const subscription = {
+    id: 9,
+    type: 'rss',
+    channelName: 'feeds.example',
+    rssUrl: 'https://feeds.example/rss',
+    chatId: '7',
+    threadId: null
+  };
+  const harness = makeHarness({
+    randomUUID() {
+      return 'source_only';
+    },
+    async listSubscriptions() {
+      return [subscription];
+    },
+    async getSubscriptionRouting() {
+      return {
+        subscriptionId: 9,
+        independent,
+        includeSource: true,
+        targets: []
+      };
+    },
+    async initializeSubscriptionRouting(env, scope, snapshot) {
+      independent = true;
+      storedSnapshot = structuredClone(snapshot);
+      return { created: true, targetsAdded: 0 };
+    },
+    async setSubscriptionIncludeSource() {
+      setIncludeSourceCalls += 1;
+      return true;
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/menu'),
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  const callbackBase = {
+    from: { id: '7' },
+    message: { chat: { id: '7', type: 'private' } }
+  };
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'show-routing',
+      data: 'ui:source_only:f:9:0'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  const routingCallbacks = harness.messages.at(-1).replyMarkup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data);
+  assert.equal(routingCallbacks.includes('ui:source_only:fs:9'), true);
+
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'source-only',
+      data: 'ui:source_only:fs:9'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.deepEqual(storedSnapshot, { includeSource: true, targets: [] });
+  assert.equal(
+    harness.messages.some((message) => /仅投递到源会话/.test(message.text)),
+    true
+  );
+
+  await handleCallback(
+    {
+      ...callbackBase,
+      id: 'source-already-enabled',
+      data: 'ui:source_only:fi:9:1'
+    },
+    { DB: kv },
+    makeConfig(),
+    harness.services
+  );
+  assert.equal(setIncludeSourceCalls, 0);
+  assert.equal(
+    harness.messages.some((message) => /源会话投递已经开启/.test(message.text)),
+    true
+  );
 });

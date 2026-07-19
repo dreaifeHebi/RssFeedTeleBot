@@ -12,6 +12,7 @@ const DEFAULT_PROCESSED_UPDATE_RETENTION_DAYS = 7;
 const DEFAULT_SENT_DELIVERY_RETENTION_DAYS = 7;
 const DEFAULT_DEAD_DELIVERY_RETENTION_DAYS = 30;
 const MAX_RETENTION_DAYS = 3_650;
+const MAX_SUBSCRIPTION_FORWARD_TARGETS = 10;
 const SECONDS_PER_DAY = 24 * 60 * 60;
 
 const INSERT_SUBSCRIPTION_SQL = `
@@ -167,6 +168,366 @@ export async function copySubscriptions(
   }
 
   const results = await database.batch(statements);
+  return results.reduce((total, result) => total + getChanges(result), 0);
+}
+
+/**
+ * Return a single consistent snapshot of subscriptions and routing settings.
+ *
+ * Subscriptions without a settings row have routing=null and continue to
+ * inherit the legacy chat/topic KV rule.
+ */
+export async function listSubscriptionsWithRouting(env) {
+  const database = getDatabase(env);
+  const result = await database.prepare(`
+      SELECT
+        subscriptions.id,
+        subscriptions.type,
+        subscriptions.channel_name,
+        subscriptions.rss_url,
+        subscriptions.chat_id,
+        subscriptions.thread_id,
+        subscriptions.created_at,
+        settings.subscription_id AS routing_subscription_id,
+        settings.include_source,
+        settings.created_at AS routing_created_at,
+        settings.updated_at AS routing_updated_at,
+        targets.id AS target_id,
+        targets.target_chat_id,
+        targets.target_thread_id,
+        targets.created_at AS target_created_at
+      FROM subscriptions
+      LEFT JOIN subscription_routing_settings AS settings
+        ON settings.subscription_id = subscriptions.id
+      LEFT JOIN subscription_forward_targets AS targets
+        ON targets.subscription_id = subscriptions.id
+      ORDER BY subscriptions.id ASC, targets.id ASC
+    `).all();
+
+  return mapSubscriptionsWithRoutingRows(getRows(result));
+}
+
+/**
+ * Read one subscription and its routing state while enforcing source scope.
+ *
+ * @returns {Promise<null | {
+ *   subscriptionId: number,
+ *   independent: boolean,
+ *   includeSource: boolean,
+ *   targets: Array<{id: number, chatId: string, threadId: string | null}>
+ * }>}
+ */
+export async function getSubscriptionRouting(env, scope) {
+  const database = getDatabase(env);
+  const normalized = normalizeRoutingScope(scope);
+  const result = await database
+    .prepare(`
+      SELECT
+        subscriptions.id AS subscription_id,
+        settings.subscription_id AS routing_subscription_id,
+        COALESCE(settings.include_source, 1) AS include_source,
+        targets.id AS target_id,
+        targets.target_chat_id,
+        targets.target_thread_id
+      FROM subscriptions
+      LEFT JOIN subscription_routing_settings AS settings
+        ON settings.subscription_id = subscriptions.id
+      LEFT JOIN subscription_forward_targets AS targets
+        ON targets.subscription_id = settings.subscription_id
+      WHERE subscriptions.id = ?
+        AND subscriptions.chat_id = ?
+        AND subscriptions.thread_id = ?
+      ORDER BY targets.id ASC
+    `)
+    .bind(
+      normalized.subscriptionId,
+      normalized.chatId,
+      normalized.threadId
+    )
+    .all();
+  const routings = mapSubscriptionRoutingRows(getRows(result));
+  return routings[0] ?? null;
+}
+
+/**
+ * Add one target and implicitly opt the subscription into independent routing.
+ *
+ * The two D1 batch statements are atomic. Both statements scope the
+ * subscription by id/chat/thread so a forged callback cannot mutate another
+ * chat's routing state.
+ *
+ * @returns {Promise<boolean>} true when a new target was inserted
+ */
+export async function addSubscriptionForwardTarget(env, scope, target) {
+  const database = getDatabase(env);
+  const normalized = normalizeRoutingScope(scope);
+  const normalizedTarget = normalizeTarget(target);
+  const results = await database.batch([
+    database
+      .prepare(`
+        INSERT INTO subscription_routing_settings (
+          subscription_id,
+          include_source,
+          created_at,
+          updated_at
+        )
+        SELECT id, 1, unixepoch(), unixepoch()
+        FROM subscriptions
+        WHERE id = ? AND chat_id = ? AND thread_id = ?
+        ON CONFLICT(subscription_id) DO NOTHING
+      `)
+      .bind(
+        normalized.subscriptionId,
+        normalized.chatId,
+        normalized.threadId
+      ),
+    database
+      .prepare(`
+        INSERT INTO subscription_forward_targets (
+          subscription_id,
+          target_chat_id,
+          target_thread_id
+        )
+        SELECT id, ?, ?
+        FROM subscriptions
+        WHERE id = ?
+          AND chat_id = ?
+          AND thread_id = ?
+          AND (
+            SELECT COUNT(*)
+            FROM subscription_forward_targets
+            WHERE subscription_id = subscriptions.id
+          ) < ?
+        ON CONFLICT(subscription_id, target_chat_id, target_thread_id)
+        DO NOTHING
+      `)
+      .bind(
+        normalizedTarget.chatId,
+        normalizedTarget.threadId,
+        normalized.subscriptionId,
+        normalized.chatId,
+        normalized.threadId,
+        MAX_SUBSCRIPTION_FORWARD_TARGETS
+      )
+  ]);
+
+  return getChanges(results[1]) > 0;
+}
+
+/**
+ * Materialize an inherited routing snapshot as one independent D1 rule.
+ *
+ * Used only for the first menu-driven customization so the subscription keeps
+ * its effective legacy chat/topic behavior while gaining independent targets.
+ */
+export async function initializeSubscriptionRouting(env, scope, routing) {
+  const database = getDatabase(env);
+  const normalized = normalizeRoutingScope(scope);
+  if (!routing || typeof routing !== 'object' || Array.isArray(routing)) {
+    throw new TypeError('routing must be an object');
+  }
+  const includeSource = normalizeBoolean(
+    routing.includeSource,
+    'routing.includeSource'
+  );
+  if (!Array.isArray(routing.targets)) {
+    throw new TypeError('routing.targets must be an array');
+  }
+  const uniqueTargets = new Map();
+  for (const target of routing.targets) {
+    const normalizedTarget = normalizeTarget(target);
+    const key = normalizedTarget.chatId + '\u0000' + normalizedTarget.threadId;
+    if (!uniqueTargets.has(key)) {
+      uniqueTargets.set(key, normalizedTarget);
+    }
+  }
+  if (uniqueTargets.size > MAX_SUBSCRIPTION_FORWARD_TARGETS) {
+    throw new TypeError(
+      `routing.targets must contain at most ${MAX_SUBSCRIPTION_FORWARD_TARGETS} unique targets`
+    );
+  }
+  if (!includeSource && uniqueTargets.size === 0) {
+    throw new TypeError(
+      'routing must keep the source or contain at least one target'
+    );
+  }
+
+  const statements = [
+    database
+      .prepare(`
+        INSERT INTO subscription_routing_settings (
+          subscription_id,
+          include_source,
+          created_at,
+          updated_at
+        )
+        SELECT id, ?, unixepoch(), unixepoch()
+        FROM subscriptions
+        WHERE id = ? AND chat_id = ? AND thread_id = ?
+        ON CONFLICT(subscription_id) DO NOTHING
+      `)
+      .bind(
+        includeSource ? 1 : 0,
+        normalized.subscriptionId,
+        normalized.chatId,
+        normalized.threadId
+      ),
+    ...Array.from(uniqueTargets.values(), (target) =>
+      database
+        .prepare(`
+          INSERT INTO subscription_forward_targets (
+            subscription_id,
+            target_chat_id,
+            target_thread_id
+          )
+          SELECT subscriptions.id, ?, ?
+          FROM subscriptions
+          INNER JOIN subscription_routing_settings AS settings
+            ON settings.subscription_id = subscriptions.id
+          WHERE subscriptions.id = ?
+            AND subscriptions.chat_id = ?
+            AND subscriptions.thread_id = ?
+            AND (
+              SELECT COUNT(*)
+              FROM subscription_forward_targets
+              WHERE subscription_id = subscriptions.id
+            ) < ?
+          ON CONFLICT(subscription_id, target_chat_id, target_thread_id)
+          DO NOTHING
+        `)
+        .bind(
+          target.chatId,
+          target.threadId,
+          normalized.subscriptionId,
+          normalized.chatId,
+          normalized.threadId,
+          MAX_SUBSCRIPTION_FORWARD_TARGETS
+        )
+    )
+  ];
+  const results = await database.batch(statements);
+  return {
+    created: getChanges(results[0]) > 0,
+    targetsAdded: results
+      .slice(1)
+      .reduce((total, result) => total + getChanges(result), 0)
+  };
+}
+
+export async function removeSubscriptionForwardTarget(env, scope) {
+  const database = getDatabase(env);
+  const normalized = normalizeRoutingTargetScope(scope);
+  const result = await database
+    .prepare(`
+      DELETE FROM subscription_forward_targets
+      WHERE id = ?
+        AND subscription_id IN (
+          SELECT id
+          FROM subscriptions
+          WHERE id = ? AND chat_id = ? AND thread_id = ?
+        )
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM subscription_routing_settings
+            WHERE subscription_id = ?
+              AND include_source = 1
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM subscription_forward_targets AS sibling
+            WHERE sibling.subscription_id = ?
+              AND sibling.id <> ?
+          )
+        )
+    `)
+    .bind(
+      normalized.targetId,
+      normalized.subscriptionId,
+      normalized.chatId,
+      normalized.threadId,
+      normalized.subscriptionId,
+      normalized.subscriptionId,
+      normalized.targetId
+    )
+    .run();
+
+  return getChanges(result) > 0;
+}
+
+export async function setSubscriptionIncludeSource(env, scope, includeSource) {
+  const database = getDatabase(env);
+  const normalized = normalizeRoutingScope(scope);
+  const normalizedIncludeSource = normalizeBoolean(
+    includeSource,
+    'includeSource'
+  );
+  const encodedIncludeSource = normalizedIncludeSource ? 1 : 0;
+  const result = await database
+    .prepare(`
+      INSERT INTO subscription_routing_settings (
+        subscription_id,
+        include_source,
+        created_at,
+        updated_at
+      )
+      SELECT id, ?, unixepoch(), unixepoch()
+      FROM subscriptions
+      WHERE id = ?
+        AND chat_id = ?
+        AND thread_id = ?
+        AND (
+          ? = 1 OR EXISTS (
+            SELECT 1
+            FROM subscription_forward_targets
+            WHERE subscription_id = subscriptions.id
+          )
+        )
+      ON CONFLICT(subscription_id) DO UPDATE SET
+        include_source = excluded.include_source,
+        updated_at = unixepoch()
+      WHERE include_source <> excluded.include_source
+    `)
+    .bind(
+      encodedIncludeSource,
+      normalized.subscriptionId,
+      normalized.chatId,
+      normalized.threadId,
+      encodedIncludeSource
+    )
+    .run();
+
+  return getChanges(result) > 0;
+}
+
+export async function resetSubscriptionRouting(env, scope) {
+  const database = getDatabase(env);
+  const normalized = normalizeRoutingScope(scope);
+  const ownershipSql = `
+    SELECT id
+    FROM subscriptions
+    WHERE id = ? AND chat_id = ? AND thread_id = ?
+  `;
+  const params = [
+    normalized.subscriptionId,
+    normalized.chatId,
+    normalized.threadId
+  ];
+  const results = await database.batch([
+    database
+      .prepare(`
+        DELETE FROM subscription_forward_targets
+        WHERE subscription_id IN (${ownershipSql})
+      `)
+      .bind(...params),
+    database
+      .prepare(`
+        DELETE FROM subscription_routing_settings
+        WHERE subscription_id IN (${ownershipSql})
+      `)
+      .bind(...params)
+  ]);
+
   return results.reduce((total, result) => total + getChanges(result), 0);
 }
 
@@ -686,6 +1047,149 @@ function mapSubscriptionRow(row) {
     threadId: denormalizeThreadId(row.thread_id),
     createdAt: Number(row.created_at)
   };
+}
+
+function mapSubscriptionsWithRoutingRows(rows) {
+  const subscriptions = new Map();
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      continue;
+    }
+
+    let subscription = subscriptions.get(id);
+    if (!subscription) {
+      subscription = {
+        ...mapSubscriptionRow(row),
+        routing:
+          row.routing_subscription_id === null ||
+          row.routing_subscription_id === undefined
+            ? null
+            : {
+                includeSource: Number(row.include_source) !== 0,
+                createdAt: Number(row.routing_created_at),
+                updatedAt: Number(row.routing_updated_at),
+                targets: []
+              }
+      };
+      subscriptions.set(id, subscription);
+    }
+
+    if (!subscription.routing) {
+      continue;
+    }
+    if (row.target_id === null || row.target_id === undefined) {
+      continue;
+    }
+    const targetId = Number(row.target_id);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+      continue;
+    }
+    subscription.routing.targets.push({
+      id: targetId,
+      chatId: String(row.target_chat_id),
+      threadId: denormalizeThreadId(row.target_thread_id),
+      createdAt: Number(row.target_created_at)
+    });
+  }
+  return [...subscriptions.values()];
+}
+
+function mapSubscriptionRoutingRows(rows) {
+  const routings = new Map();
+  for (const row of rows) {
+    const subscriptionId = Number(row.subscription_id);
+    if (!Number.isSafeInteger(subscriptionId) || subscriptionId <= 0) {
+      continue;
+    }
+
+    let routing = routings.get(subscriptionId);
+    if (!routing) {
+      routing = {
+        subscriptionId,
+        independent:
+          row.routing_subscription_id !== null &&
+          row.routing_subscription_id !== undefined,
+        includeSource: Number(row.include_source) !== 0,
+        targets: []
+      };
+      routings.set(subscriptionId, routing);
+    }
+
+    if (row.target_id === null || row.target_id === undefined) {
+      continue;
+    }
+    const targetId = Number(row.target_id);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+      continue;
+    }
+    routing.targets.push({
+      id: targetId,
+      chatId: String(row.target_chat_id),
+      threadId: denormalizeThreadId(row.target_thread_id)
+    });
+  }
+  return [...routings.values()];
+}
+
+function normalizeRoutingScope(scope) {
+  if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
+    throw new TypeError('routing scope must be an object');
+  }
+  const allowedKeys = new Set([
+    'subscriptionId',
+    'subscription_id',
+    'id',
+    'chatId',
+    'chat_id',
+    'threadId',
+    'thread_id'
+  ]);
+  const unknownKeys = Object.keys(scope).filter((key) => !allowedKeys.has(key));
+  if (unknownKeys.length > 0) {
+    throw new TypeError(
+      `Unsupported routing scope: ${unknownKeys.join(', ')}`
+    );
+  }
+  return {
+    subscriptionId: normalizeSubscriptionId(
+      scope.subscriptionId ?? scope.subscription_id ?? scope.id
+    ),
+    chatId: normalizeChatId(scope.chatId ?? scope.chat_id),
+    threadId: normalizeThreadId(scope.threadId ?? scope.thread_id)
+  };
+}
+
+function normalizeRoutingTargetScope(scope) {
+  const {
+    targetId,
+    target_id: targetIdSnake,
+    ...routingScope
+  } = scope ?? {};
+  return {
+    ...normalizeRoutingScope(routingScope),
+    targetId: normalizePositiveId(
+      targetId ?? targetIdSnake,
+      'targetId'
+    )
+  };
+}
+
+function normalizePositiveId(value, label) {
+  const isDigitString = typeof value === 'string' && /^[0-9]+$/.test(value);
+  const normalized =
+    typeof value === 'number' || isDigitString ? Number(value) : NaN;
+  if (!Number.isSafeInteger(normalized) || normalized <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return normalized;
+}
+
+function normalizeBoolean(value, label) {
+  if (value !== true && value !== false) {
+    throw new TypeError(`${label} must be a boolean`);
+  }
+  return value;
 }
 
 function mapDeliveryRow(row) {

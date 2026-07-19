@@ -43,6 +43,8 @@ export function parseCommand(text, botUsername = '') {
 }
 
 const MANAGEMENT_COMMANDS = new Set([
+  'start',
+  'menu',
   'add',
   'del',
   'remove',

@@ -18,7 +18,7 @@ A serverless Telegram bot that monitors RSS feeds, X (Twitter) users, and YouTub
 
 1. **Cloudflare account**: [Sign up here](https://dash.cloudflare.com/sign-up).
 2. **Telegram bot token**: Get one from [@BotFather](https://t.me/BotFather).
-3. **Node.js 22+** and npm for local setup.
+3. **Node.js 22.13+** and npm for local setup.
 4. **GitHub account** only if you use the included deployment workflow.
 
 ## Setup Guide
@@ -156,7 +156,7 @@ Telegram will send this value in `X-Telegram-Bot-Api-Secret-Token`; requests wit
 
 ## Authorization and Feed URL Security
 
-- Management commands are `/add`, `/del`, `/remove`, `/set_forward`, `/del_forward`, and `/forward_to`.
+- Management commands are `/start`, `/menu`, `/add`, `/del`, `/remove`, `/set_forward`, `/del_forward`, and `/forward_to`. Menu callbacks and follow-up text input re-check the same authorization.
 - If `ADMIN_USER_IDS` is set, only users in that allowlist may run management commands; the allowlist is also explicit global authorization for cross-chat forwarding changes.
 - Without an allowlist, a private chat is managed only by its owner. In groups, the sender must be a Telegram creator or administrator. For `/set_forward` or `/forward_to` targeting a different chat, the sender must also administer the target chat (same-chat and self private-chat targets are exempt). Make the bot a group administrator so `getChatMember` can reliably verify other users; failed verification denies the command.
 - Feed validation rejects non-HTTP(S) schemes, credentials, localhost, and private IP literals. `ALLOWED_FEED_HOSTS` should be set when users may submit arbitrary URLs.
@@ -166,6 +166,23 @@ Telegram will send this value in `X-Telegram-Bot-Api-Secret-Token`; requests wit
 ## Usage
 
 Add the bot to your Group or Supergroup.
+
+### Recommended: menu-first management
+
+Send `/menu` to open the main menu. It lets you:
+
+- choose RSS, X, or YouTube and reply with the URL/username;
+- page through subscriptions in the current chat/topic and confirm deletions;
+- manage forwarding targets, source delivery, and default-route inheritance per subscription, including an explicit source-only override;
+- enter a target chat/topic and choose subscriptions to copy from a paginated list;
+- view the current Chat ID, Topic ID, and help.
+
+Input sessions expire after 10 minutes and menus after one hour. Both are bound
+to the initiating user, chat, and topic. In groups, reply directly to the bot's
+input prompt. Use `/cancel` to cancel the current input. RSS labels continue to
+show only the hostname, never URL paths, query values, or credentials.
+
+The commands below remain available as shortcuts.
 
 *   **Add Subscription**:
     ```text
@@ -200,8 +217,8 @@ Add the bot to your Group or Supergroup.
     ```
     *Output format:* `#<subscription_id> [type] safe_name` (for example, `#42 [rss] example.com`). RSS safe names contain only the hostname; URL paths and embedded credentials are never displayed.
 
-*   **Forwarding Settings**:
-    Configure message forwarding to another channel/group.
+*   **Default Chat/Topic Message Forwarding**:
+    Configure the default route for subscriptions in the current chat/topic.
     ```text
     /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]
     ```
@@ -221,11 +238,32 @@ Add the bot to your Group or Supergroup.
     ```
     *   Default scope is `topic`. Use `/del_forward global` to remove global config.
 
-*   **Forward Subscriptions (Bulk Copy)**:
+    Subscriptions with independent rules are not changed by later
+    `/set_forward` or `/del_forward` commands. Restore inheritance in that
+    subscription's menu before it follows the default again.
+
+*   **Per-subscription message forwarding (menu)**:
+    Open `/menu`, choose **Message Forwarding**, then choose a subscription.
+    Each subscription can have up to 10 independently removable target
+    chats/topics, can keep or suppress its source delivery, and can return to
+    the current topic/global default rule. **Source only (stop inheriting)**
+    explicitly excludes the inherited default target for that subscription.
+
+    A normal first customization starts from the subscription's effective
+    legacy default route before applying the new target, preserving the old
+    target and `only_forward` behavior. Choosing **Source only** intentionally
+    stops inheritance and excludes that default target. The bot refuses to
+    disable source delivery without a target, or to remove the final target
+    while source delivery is disabled. Changes affect only future enqueueing;
+    existing outbox deliveries are unchanged.
+
+*   **Copy Subscriptions (not message forwarding)**:
     Allows copying subscriptions from the current chat to another chat.
     ```text
     /forward_to <target_chat_id> [target_thread_id]
     ```
+    Large subscription lists are paginated; the source and copied subscriptions
+    are managed independently afterward.
 
 *   **Get Chat Info**:
     ```text
@@ -249,8 +287,8 @@ Add the bot to your Group or Supergroup.
 
 ### Storage ownership
 
-- **D1 (`SQL`)** owns `subscriptions`, `processed_updates`, `operational_leases`, and `deliveries`. The operational lease prevents overlapping scheduled runs from draining the same queue concurrently. Each item/target pair has its own outbox row, so partial Telegram failures can be retried without losing successful targets.
-- **KV (`DB`)** stores bounded per-feed seen history, forwarding configuration, short-lived forwarding sessions, and the polling cursor.
+- **D1 (`SQL`)** owns `subscriptions`, `subscription_routing_settings`, `subscription_forward_targets`, `processed_updates`, `operational_leases`, and `deliveries`. Per-subscription rules and targets are linked to stable subscription IDs. Each item/final-target pair has its own outbox row, so partial Telegram failures can be retried independently.
+- **KV (`DB`)** stores bounded per-feed seen history, legacy chat/topic default forwarding configuration, short-lived menu/input/copy sessions, and the polling cursor.
 - A legacy KV `subscriptions` array is copied into D1 automatically on the first invocation after migrations are applied. The import and migration marker are committed together, and the old KV value is intentionally retained for rollback/audit; remove it manually only after verifying D1.
 - Delivery is at-least-once: if the Worker crashes after Telegram accepts a message but before D1 records it as sent, a later retry can deliver that message again.
 

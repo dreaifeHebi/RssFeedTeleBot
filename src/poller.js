@@ -3,7 +3,7 @@ import {
   enqueueDeliveries,
   ensureLegacySubscriptionsMigrated,
   listPendingDeliveries,
-  listSubscriptions,
+  listSubscriptionsWithRouting,
   markDeliveryRetry,
   markDeliverySent,
   pruneOperationalState,
@@ -32,7 +32,7 @@ const MAX_RETRY_DELAY_SECONDS = 60 * 60;
 const DEFAULT_DEPENDENCIES = Object.freeze({
   ensureLegacySubscriptionsMigrated,
   acquireOperationalLease,
-  listSubscriptions,
+  listSubscriptions: listSubscriptionsWithRouting,
   fetchFeed,
   buildItemFingerprint,
   normalizeUrlForDedup,
@@ -503,6 +503,32 @@ async function resolveTargets(kv, subscribers, cache, logger) {
       chatId: subscription.chatId,
       threadId: subscription.threadId
     };
+    const independentRouting = subscription?.routing;
+    if (independentRouting) {
+      if (independentRouting.includeSource) {
+        addUniqueTarget(targets, originalTarget);
+      }
+      const independentTargets = Array.isArray(independentRouting.targets)
+        ? independentRouting.targets
+        : [];
+      for (const target of independentTargets) {
+        addUniqueTarget(targets, target);
+      }
+      if (
+        !independentRouting.includeSource &&
+        independentTargets.length === 0
+      ) {
+        log(
+          logger,
+          'warn',
+          'Falling back to source for empty independent routing on subscription #' +
+            String(subscription?.id ?? 'unknown')
+        );
+        addUniqueTarget(targets, originalTarget);
+      }
+      continue;
+    }
+
     const hasThread = subscription.threadId !== null;
     let forwardConfig = null;
 

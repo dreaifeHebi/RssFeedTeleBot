@@ -191,6 +191,108 @@ test('migrates, rotates feeds, resolves forwarding, enqueues every target, then 
   );
 });
 
+test('independent subscription routing overrides legacy KV per subscription', async () => {
+  const DB = new FakeKv({
+    'forward_config:100': JSON.stringify({
+      targetChatId: '-999',
+      onlyForward: true,
+      isGlobal: true
+    }),
+    'forward_config:200': JSON.stringify({
+      targetChatId: '-600',
+      onlyForward: false,
+      isGlobal: false
+    })
+  });
+  const subscriptions = [
+    {
+      id: 1,
+      rssUrl: 'https://feeds.test/x',
+      channelName: 'X',
+      chatId: '100',
+      threadId: null,
+      routing: {
+        includeSource: false,
+        targets: [
+          { id: 21, chatId: '-500', threadId: null },
+          { id: 22, chatId: '-501', threadId: '7' }
+        ]
+      }
+    },
+    {
+      id: 2,
+      rssUrl: 'https://feeds.test/x',
+      channelName: 'X',
+      chatId: '200',
+      threadId: null,
+      routing: null
+    }
+  ];
+  const enqueued = [];
+
+  await runScheduled(
+    { DB },
+    BASE_CONFIG,
+    baseDependencies({
+      listSubscriptions: async () => subscriptions,
+      fetchFeed: async () => ({
+        title: 'Independent',
+        items: [{
+          title: 'New item',
+          guid: 'new-item',
+          link: 'https://feeds.test/x/1'
+        }]
+      }),
+      enqueueDeliveries: async (_env, payload) => {
+        enqueued.push(payload);
+        return payload.targets.length;
+      }
+    })
+  );
+
+  assert.equal(enqueued.length, 1);
+  assert.deepEqual(enqueued[0].targets, [
+    { chatId: '-500', threadId: null },
+    { chatId: '-501', threadId: '7' },
+    { chatId: '-600', threadId: null },
+    { chatId: '200', threadId: null }
+  ]);
+  assert.equal(DB.gets.includes('forward_config:100'), false);
+  assert.equal(DB.gets.includes('forward_config:200'), true);
+});
+
+test('empty independent routing safely falls back to the source target', async () => {
+  const DB = new FakeKv();
+  const enqueued = [];
+  const warnings = [];
+  await runScheduled(
+    { DB },
+    BASE_CONFIG,
+    baseDependencies({
+      listSubscriptions: async () => [{
+        id: 3,
+        rssUrl: 'https://feeds.test/y',
+        channelName: 'Y',
+        chatId: '300',
+        threadId: '4',
+        routing: { includeSource: false, targets: [] }
+      }],
+      fetchFeed: async () => ({
+        title: 'Fallback',
+        items: [{ title: 'New', guid: 'new', link: 'https://feeds.test/y/1' }]
+      }),
+      enqueueDeliveries: async (_env, payload) => {
+        enqueued.push(payload);
+        return payload.targets.length;
+      },
+      logger: { error() {}, warn(message) { warnings.push(message); } }
+    })
+  );
+
+  assert.deepEqual(enqueued[0].targets, [{ chatId: '300', threadId: '4' }]);
+  assert.match(warnings[0], /Falling back to source.*#3/);
+});
+
 test('recognizes the original Worker fingerprint and does not enqueue a duplicate', async () => {
   const item = {
     title: 'Hello',

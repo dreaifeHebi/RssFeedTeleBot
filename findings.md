@@ -274,3 +274,64 @@ RssFeedTeleBot 已从单文件、KV 数组状态重构为单 Worker 的模块化
 - 异常可能回显 `init.body`，其中换行和引号已 JSON 转义；最终脱敏覆盖原始、URL encoded 与 JSON-escaped 敏感值变体。
 - 3xx 只解析并记录经过 hostname label 校验的 `redirectHost`；不保存 Location/path/query，可用于确认是否真的出现域名迁移。
 - 最终全量测试 98/98；Wrangler 4.111.0 dry-run 通过并生成 source map；生产尚未部署。
+
+---
+
+# Interaction and forwarding UX findings (2026-07-20)
+
+## Current interaction
+
+- src/commands.js 只处理斜杠命令；普通文本没有反馈，handleCallback 仅识别旧的 fwd:* 复制会话。
+- /start 与 /help 是英文静态说明；没有主菜单、返回、取消、分页、删除确认或转发配置查看入口。
+- /list 只输出文本，删除时需手工复制 #ID。
+- /set_forward 是“消息路由”，每个 chat/topic KV key 只能保存一个目标；再次设置会覆盖。
+- /forward_to 是“复制订阅”，复制后两边完全独立；当前单项点击会立即消费 session，不能多选。
+- 订阅已在 D1 中拥有稳定 ID，适合用作详情、删除确认和独立转发规则的所有权锚点。
+
+## Independent forwarding model
+
+- 新增 subscription_routing_settings：每条订阅是否保留源投递。
+- 新增 subscription_forward_targets：一条订阅可有多个独立目标，每个目标可单独删除。
+- 无 settings 行时继续使用旧 KV topic/global 规则；存在 settings 行时由该订阅独立路由覆盖继承。
+- Poller 继续按最终 chat/thread 去重；多个订阅指向同一目标时仍只生成一份 delivery。
+- include_source=false 且目标数为零必须被拒绝。
+- 删除或修改规则只影响未来 enqueue；已入队 delivery 保持原语义。
+
+## Target interaction
+
+- /start 和新增 /menu 打开首页：添加订阅、管理订阅、消息转发、复制订阅、当前会话、帮助。
+- 添加流程支持按钮选择 RSS/X/YouTube，再直接发送 URL 或用户名，并可取消。
+- 管理列表通过稳定订阅 ID 打开详情；删除需二次确认。
+- 转发主页按订阅进入，展示“继承 chat/topic 规则”或独立目标列表，可添加目标、切换源投递、单独删除和恢复继承。
+- 所有旧命令保持兼容，文案明确把 /forward_to 称为“复制订阅”。
+
+## 交互复审（2026-07-20）
+
+- 群聊 ForceReply 不应设置 selective=true 而又不 @ 用户；否则 Telegram 客户端可能不向发起管理操作的用户展示回复框。
+- 用户添加一个已经由默认规则继承的目标时，不能先物化独立配置再提示“已存在”，否则会静默停止继承未来的默认规则变化。
+- 每个订阅需要显式“仅源会话”入口，才能在保留源投递的同时停止继承默认转发目标。
+- 旧 /forward_to 复制选择器也需要分页，避免订阅较多时键盘超长。
+- 逐订阅最多 10 个目标不能只在命令层先读后写；存储层 INSERT 需要带计数条件，初始化快照也需校验上限。
+- 重复切换源投递应幂等，避免状态未变化却显示误导性的保护提示。
+- 本地 Node.js v24.16.0 提供 node:sqlite，可用真实 SQLite 执行迁移回归测试而不新增依赖。
+
+## Test baseline
+
+- 改造前 npm test 为 98/98；npm run check 通过。
+- 现有 node:test 夹具足以覆盖菜单、KV session、权限、存储和 Poller。
+- storage.js 已有统一的 chat/thread 字符串规范化和参数化查询，可复用到新 routing API。
+- subscriptions 的 D1 ID 是正安全整数；新转发写操作必须同时限定 subscription ID、源 chat 与源 thread。
+- deliveries 已按最终 feed/item/chat/thread 唯一，现有 enqueue 层无需 schema 变化即可承接多个独立目标。
+- Poller 当前按 rssUrl 合并订阅后再按 chat/thread 去重；接入独立路由时必须保留 subscription ID，不能在解析规则前把同一目的地的重复订阅丢掉。
+- 现有管理权限集合不包含 menu/list；只读菜单可开放，但每个修改型 Callback 和输入 session 仍需重新走 canManageChat。
+- 当前测试使用可注入服务与 FakeD1 SQL 快照，适合验证所有权过滤、目标去重和旧 KV 回退。
+- 双语 README 的 Usage 仍以命令为主，需把 /menu 置为推荐入口，并把 default forwarding、per-subscription routing 和 subscription copy 三种语义分开说明。
+- 存储文档需新增 subscription_routing_settings、subscription_forward_targets，以及 UI session 仍留在 KV 的职责边界。
+- CI 明确使用 Node 22，package engines 也是 >=22；node:sqlite migration 测试不需要新增依赖。
+- 真实迁移测试会关闭 foreign_keys，直接验证 cleanup trigger；同时覆盖目标唯一约束与跨订阅相同目标可共存。
+- 双语 Usage 已覆盖菜单、继承与独立目标，但还应明确每订阅 10 目标上限，以及“仅源会话”是主动停止继承的例外。
+- 复制订阅选择器现已分页，文档应避免让大量订阅用户预期一个无限长键盘。
+- 最终复审确认无 P1；剩余 P2 是 initializeSubscriptionRouting 的每条 INSERT 也需原子 COUNT < 10，避免并发首次自定义越界。
+- node:sqlite 从 Node 22.13 起无需 experimental flag；项目 root engine 应从 >=22 收紧到 >=22.13.0，并同步 package-lock root。
+- 复审后的两个 P2 均已修复：初始化路径原子封顶 10 个目标，Node engine 与 node:sqlite 下限一致。
+- 最后一次只读复审未发现剩余 P1/P2。

@@ -2,6 +2,24 @@ name = "rss-feed-bot"
 main = "index.js"
 compatibility_date = "2026-07-17"
 compatibility_flags = ["nodejs_compat"]
+upload_source_maps = true
+
+# Persist every allowlisted application log while diagnosing Telegram egress.
+# Source maps keep uncaught runtime stacks readable without logging them ourselves.
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1.0
+invocation_logs = true
+persist = true
+
+[observability.traces]
+# Automatic fetch spans contain url.full/url.path. Telegram embeds the bot token
+# in that path, so traces must stay off until those attributes can be redacted or
+# the Bot API call is moved behind a token-hiding proxy.
+enabled = false
 
 [triggers]
 crons = ["*/15 * * * *"]

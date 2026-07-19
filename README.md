@@ -110,6 +110,37 @@ npm run deploy
 
 Then set the required Worker secrets if you have not done so already. Run migrations before every deployment that introduces a new file under `migrations/`.
 
+#### Workers observability and Telegram diagnostics
+
+`wrangler.toml` explicitly enables persisted Workers Logs, invocation logs,
+and uploaded source maps. Logs use 100% head sampling while the Telegram
+egress failure is under investigation. The configuration takes effect only
+after the next deployment.
+
+Stream events during verification with:
+
+```bash
+npx wrangler tail rss-feed-bot --format json
+```
+
+Telegram failures are emitted as structured records. Useful fields include:
+
+- `source` and `operation` (`sendMessage`, `getChatMember`, or `answerCallbackQuery`);
+- `failureKind` and `failurePhase` (`fetch`, `redirect`, `response_body`, `response_parse`, or `response_validate`);
+- `upstreamStatus`, hostname-only `redirectHost`, `durationMs`, timeout state, exception name/message, and safe cause details;
+- `deliveryId`, `attempt`, `maxAttempts`, and `exhausted` for scheduled Outbox sends.
+
+The diagnostic allowlist never logs the bot token, Bot API URL, redirect
+location, chat/thread IDs, message payload, response body, or stack. Workers
+Logs add invocation, version, and Cloudflare metadata, while source maps keep
+uncaught runtime stacks readable.
+
+Automatic Workers Traces are intentionally disabled. Cloudflare's automatic
+`fetch` spans currently capture `url.full` and `url.path`, but Telegram
+puts the bot token in the Bot API path. Do not enable traces until those
+attributes can be redacted or the request is routed through a trusted
+token-hiding proxy.
+
 ### 4. Register the authenticated Telegram webhook
 
 Find the deployed Worker URL, then register it with the same secret stored as `TELEGRAM_WEBHOOK_SECRET`:

@@ -110,6 +110,34 @@ npm run deploy
 
 如果尚未设置 Worker 必填密钥，请在部署后设置。以后只要 `migrations/` 中增加了迁移文件，都应在部署前先执行迁移。
 
+#### Workers 可观测性与 Telegram 诊断
+
+`wrangler.toml` 已显式开启持久化 Workers Logs、Invocation Logs 和
+Source Maps。Telegram 出站故障定位期间，日志采用 100% head sampling；
+这些设置只有在下一次部署后才会生效。
+
+验证时可实时查看：
+
+```bash
+npx wrangler tail rss-feed-bot --format json
+```
+
+Telegram 失败会输出结构化记录，重点字段包括：
+
+- `source`、`operation`（`sendMessage`、`getChatMember` 或 `answerCallbackQuery`）；
+- `failureKind`、`failurePhase`（`fetch`、`redirect`、`response_body`、`response_parse` 或 `response_validate`）；
+- `upstreamStatus`、仅主机名的 `redirectHost`、`durationMs`、超时状态、异常 name/message 与安全的 cause 字段；
+- 定时 Outbox 的 `deliveryId`、`attempt`、`maxAttempts` 和 `exhausted`。
+
+诊断白名单不会记录 Bot Token、Bot API URL、重定向 Location、chat/thread
+ID、消息 payload、响应正文或 stack。Workers Logs 会补充 Invocation、版本
+和 Cloudflare 元数据；Source Maps 可还原未捕获运行时异常的源码位置。
+
+自动 Workers Traces 被刻意关闭：Cloudflare 自动 `fetch` span 当前会采集
+`url.full` 和 `url.path`，而 Telegram Bot API 会把 Bot Token 放在 URL
+路径中。在这些属性可脱敏，或请求改经可信的隐藏 Token 代理之前，不要开启
+Traces。
+
 ### 4. 注册带鉴权的 Telegram Webhook
 
 找到已部署的 Worker URL，然后使用与 `TELEGRAM_WEBHOOK_SECRET` 相同的密钥注册：

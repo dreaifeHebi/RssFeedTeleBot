@@ -15,7 +15,12 @@ import {
   normalizeUrlForDedup,
   simpleHash
 } from './feeds.js';
-import { renderFeedMessage, sendTelegramMessage } from './telegram.js';
+import {
+  buildTelegramFailureLogDetails,
+  renderFeedMessage,
+  sanitizeTelegramLogValue,
+  sendTelegramMessage
+} from './telegram.js';
 
 const POLL_CURSOR_KEY = 'poll_cursor';
 const SENT_HISTORY_PREFIX = 'sent_guids:';
@@ -34,7 +39,9 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   simpleHash,
   renderFeedMessage,
   enqueueDeliveries,
+  buildTelegramFailureLogDetails,
   listPendingDeliveries,
+  sanitizeTelegramLogValue,
   sendTelegramMessage,
   markDeliverySent,
   markDeliveryRetry,
@@ -228,6 +235,11 @@ async function drainDeliveryQueue(env, config, dependencies, stats) {
 
   for (const delivery of deliveries) {
     stats.deliveriesProcessed += 1;
+    const sensitiveValues = [
+      delivery.message,
+      delivery.chatId,
+      delivery.threadId
+    ];
     let result;
     try {
       result = await dependencies.sendTelegramMessage(
@@ -239,14 +251,12 @@ async function drainDeliveryQueue(env, config, dependencies, stats) {
         { fetchFn: dependencies.fetchFn }
       );
     } catch (error) {
-      result = {
-        ok: false,
-        status: 0,
-        retryable: true,
-        permanent: false,
-        retryAfterSeconds: 0,
-        error: errorMessage(error)
-      };
+      result = caughtTelegramFailure(
+        error,
+        config.telegramBotToken,
+        sensitiveValues,
+        dependencies.sanitizeTelegramLogValue
+      );
     }
 
     if (result?.ok) {
@@ -267,9 +277,38 @@ async function drainDeliveryQueue(env, config, dependencies, stats) {
     const retryAfterSeconds = permanent
       ? 0
       : positiveRetryDelay(result?.retryAfterSeconds, delivery.attempts);
-    const baseError =
-      result?.error ||
+    const fallbackError =
       `Telegram delivery failed with status ${Number(result?.status) || 0}`;
+    const baseError = dependencies.sanitizeTelegramLogValue(
+      result?.error || fallbackError,
+      config.telegramBotToken,
+      sensitiveValues
+    ) || fallbackError;
+
+    const logResult = {
+      ...result,
+      permanent,
+      retryAfterSeconds
+    };
+    log(
+      dependencies.logger,
+      'error',
+      dependencies.buildTelegramFailureLogDetails(
+        config.telegramBotToken,
+        'sendMessage',
+        logResult,
+        {
+          message: 'Telegram delivery failed.',
+          source: 'scheduled',
+          deliveryId: delivery.id,
+          attempt: attemptsAfterFailure,
+          maxAttempts,
+          exhausted,
+          sensitiveValues
+        }
+      )
+    );
+
     await dependencies.markDeliveryRetry(env, delivery.id, {
       error: exhausted
         ? `${baseError} (delivery attempts exhausted at ${maxAttempts})`
@@ -639,6 +678,8 @@ function validateInputs(env, config, dependencies) {
     'renderFeedMessage',
     'enqueueDeliveries',
     'listPendingDeliveries',
+    'buildTelegramFailureLogDetails',
+    'sanitizeTelegramLogValue',
     'sendTelegramMessage',
     'markDeliverySent',
     'markDeliveryRetry',
@@ -693,6 +734,79 @@ function recordError(stats, logger, stage, error, rssUrl) {
     'error',
     `${stage} failure for ${safeRssUrl ?? 'scheduled task'}: ${message}`
   );
+}
+
+function caughtTelegramFailure(error, token, sensitiveValues, sanitize) {
+  const cause = safeErrorProperty(error, 'cause');
+  const exceptionMessage = sanitize(
+    safeErrorProperty(error, 'message') || errorMessage(error),
+    token,
+    sensitiveValues
+  );
+  return {
+    ok: false,
+    status: 0,
+    retryable: true,
+    permanent: false,
+    retryAfterSeconds: 0,
+    error: exceptionMessage || 'Telegram send threw an unexpected exception',
+    result: null,
+    diagnostic: {
+      failureKind: 'caller_exception',
+      failurePhase: 'send',
+      durationMs: 0,
+      timeoutMs: 0,
+      upstreamHost: 'api.telegram.org',
+      upstreamStatus: 0,
+      responseContentType: null,
+      responseBodyLength: 0,
+      timedOut: false,
+      exceptionName: nullableSanitizedErrorField(
+        safeErrorProperty(error, 'name') ||
+          (error instanceof Error ? error.constructor?.name : 'ThrownValue'),
+        token,
+        sensitiveValues,
+        sanitize
+      ),
+      exceptionMessage: exceptionMessage || null,
+      causeName: nullableSanitizedErrorField(
+        safeErrorProperty(cause, 'name'),
+        token,
+        sensitiveValues,
+        sanitize
+      ),
+      causeCode: nullableSanitizedErrorField(
+        safeErrorProperty(cause, 'code'),
+        token,
+        sensitiveValues,
+        sanitize
+      ),
+      causeMessage: nullableSanitizedErrorField(
+        safeErrorProperty(cause, 'message'),
+        token,
+        sensitiveValues,
+        sanitize
+      )
+    }
+  };
+}
+
+function nullableSanitizedErrorField(value, token, sensitiveValues, sanitize) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  return sanitize(value, token, sensitiveValues) || null;
+}
+
+function safeErrorProperty(value, key) {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) {
+    return null;
+  }
+  try {
+    return value[key];
+  } catch {
+    return null;
+  }
 }
 
 function chooseSafeSourceName(subscriptionName, feedTitle, rssUrl) {

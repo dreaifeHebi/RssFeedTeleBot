@@ -86,3 +86,80 @@ Complete — implementation and final verification finished on 2026-07-17.
 - 投递为 at-least-once，崩溃窗口内允许重复。
 - 应用层无法验证主机名的真实 DNS 解析结果，严格 SSRF 防护仍需要 DNS/出口策略。
 - 提高 Feed 或 Telegram 上限前必须重新核对当前 Cloudflare 套餐的 subrequest 限制。
+
+---
+
+# Diagnostic Plan: Telegram network request failure (2026-07-20)
+
+## Goal
+
+判定生产 Worker 的 `sendMessage` 出现 `status: 0` / `Telegram network request failed` 是否与 Telegram 域名变化有关，并给出有证据的根因范围与下一步。
+
+## Current Phase
+
+Complete — diagnosis and evidence collection finished; no business code changed.
+
+## Phases
+
+- [x] D1：检查 Telegram 请求构造、异常归类与部署配置（complete）
+- [x] D2：核对 Telegram 官方 Bot API 域名及近期变更（complete）
+- [x] D3：运行定向测试/网络探测并区分 DNS、TLS、超时与 API 响应（complete）
+- [x] D4：汇总结论、证据和建议；不经授权不改业务代码（complete）
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| workspace 命令首次触发 `bwrap: setting up uid map: Permission denied` | 1 | 按沙箱策略改为经批准的只读命令；未扩大工作区写入范围 |
+| 内置 apply_patch 与 shell apply_patch 均因 fs sandbox helper 的 loopback RTM_NEWADDR 失败；首次 `git apply` 补丁计数也有误 | 1–3 | 改为逐文件、精确 hunk 计数的 `git apply`，仍只写工作区计划文件 |
+
+---
+
+# Implementation Plan: Telegram diagnostics and Workers observability (2026-07-20)
+
+## Goal
+
+为 Telegram 出站请求增加可区分 fetch、redirect、响应读取与超时故障的安全诊断字段；通过 Wrangler 开启 100% 持久化 Workers Logs、Invocation Logs 与 Source Maps，并因 Bot Token 位于 URL path 中而显式关闭自动 Traces。
+
+## Current Phase
+
+Complete — patch, documentation, security review, tests, and Wrangler dry-run finished; production is not deployed.
+
+## Phases
+
+- [x] I1：检查完整调用链、日志路径、测试和最新 observability 配置（complete）
+- [x] I2：实现 Telegram 分阶段异常诊断及严格脱敏（complete）
+- [x] I3：配置安全的 Workers Logs/Source Maps 并补充双语运维文档（complete）
+- [x] I4：补齐测试，运行全量校验和 Wrangler dry-run（complete）
+- [x] I5：汇总部署与线上验证步骤；未经明确授权不部署生产（complete）
+
+## Safety Constraints
+
+- 不记录 Telegram bot token、完整 Bot API URL、chat text 或请求 payload。
+- 保持现有公开返回结构兼容；诊断字段只用于结构化日志/内部结果。
+- 不自动重放 dead/pending delivery，避免修复前后重复发送。
+
+## Implementation Errors
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| 首次追加 toolchain finding 的 fallback patch 行号偏移 | 1 | 读取文件尾部确认真实行号；未造成写入 |
+| 多文件 fallback patch 的 task_plan 上下文不存在 | 2 | 确认前一 hunk 计数不足导致尾部未写入，改用单文件且逐行核算 hunk 数量 |
+| observability findings hunk 的新增行数少计一行，末行被忽略，后续追加行号失配 | 1 | 读取实际 EOF，补齐遗漏行并按“原上下文 + 新增行”重新核算 |
+| Phase I1→I2 的手写 hunk 总行数多计一行，`git apply` 报损坏 | 1 | 改用 `git apply --recount` 让 Git 从内容重新核算，后续 fallback patch 统一使用该模式 |
+| 单个大型 telegram.js fallback patch 即使使用 recount 仍在首 hunk 匹配失败 | 1 | 确认文件未发生部分写入；拆为按常量、导出、核心请求和 helper 的小型单文件补丁 |
+| poller.js 多 hunk patch 在首个 import hunk 匹配失败 | 1 | 确认无部分写入；沿用已验证策略拆成 import/default、queue、validation/helper 三个小补丁 |
+| 首次定向测试 31/37，通过语法检查但 6 个旧 deepEqual/redirect 断言失败 | 1 | 失败均为预期结构变化（diagnostic、source、manual redirect、invalid_json 文案）；进入 I4 时更新并扩展安全测试 |
+| 同时追加 task_plan/progress 的多文件 patch 因 progress 上下文不存在而整体失败 | 1 | 不重复多文件写法，继续使用单文件 patch 并先读取实际 EOF |
+| 内置 apply_patch 持续因 bwrap loopback 失败，git/patch 又无法替换未提交新增行；一次多命令 ed 搜索未完整命中 | 1–3 | 立即运行语法与分段检查，确认仅 helper 插入成功；随后改用逐段精确行号 ed，恢复并验证全部目标代码 |
+| 安全复核发现自动 fetch Trace 会持久化含 Bot Token 的 `url.full/url.path` | 1 | 保留 100% Workers Logs 和 Source Maps，将 `[observability.traces]` 显式设为 `enabled=false`，双语文档同步说明 |
+| 安全复核复现非 2xx response body 与 JSON-escaped payload 可能绕过原始值替换 | 1 | 非 2xx 错误固定为 `Telegram HTTP <status>`；敏感值增加 JSON/URL 编码变体脱敏和回归测试 |
+
+## Final Verification
+
+- `npm test`: 98/98 passed.
+- `npm run check`: passed.
+- `git diff --check`: passed.
+- Wrangler 4.111.0 dry-run: passed, 265.64 KiB / gzip 63.67 KiB.
+- Dry-run artifact includes `index.js.map`.
+- Production deploy and delivery replay were not performed.

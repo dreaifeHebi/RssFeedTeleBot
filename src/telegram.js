@@ -1,7 +1,27 @@
-const TELEGRAM_API_BASE = 'https://api.telegram.org';
+const TELEGRAM_API_HOST = 'api.telegram.org';
+const TELEGRAM_API_BASE = `https://${TELEGRAM_API_HOST}`;
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_CALLBACK_TEXT_LENGTH = 200;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_DIAGNOSTIC_TEXT_LENGTH = 500;
+const TELEGRAM_FAILURE_KINDS = new Set([
+  'network_exception',
+  'timeout',
+  'unexpected_redirect',
+  'invalid_response',
+  'invalid_json',
+  'invalid_api_response',
+  'http_error',
+  'caller_exception'
+]);
+const TELEGRAM_FAILURE_PHASES = new Set([
+  'fetch',
+  'redirect',
+  'response_body',
+  'response_parse',
+  'response_validate',
+  'send'
+]);
 
 export function escapeHtml(value = '') {
   return String(value ?? '')
@@ -117,6 +137,99 @@ export function isChatAdministrator(memberOrResponse) {
   return member?.status === 'creator' || member?.status === 'administrator';
 }
 
+/**
+ * Build an allowlisted, query-friendly Workers Logs object. Unknown fields on
+ * result/context are deliberately ignored so URLs, payloads, and stack traces
+ * cannot be logged by accidentally spreading an Error or API result.
+ */
+export function buildTelegramFailureLogDetails(
+  token,
+  operation,
+  result,
+  context = {}
+) {
+  const sensitiveValues = Array.isArray(context?.sensitiveValues)
+    ? context.sensitiveValues
+    : [];
+  const details = {
+    message: sanitizeTelegramLogValue(
+      context?.message || 'Telegram API request failed.',
+      token,
+      sensitiveValues
+    ),
+    operation: sanitizeTelegramLogValue(operation, token, sensitiveValues),
+    status: nonNegativeInteger(result?.status),
+    retryable: Boolean(result?.retryable),
+    permanent: Boolean(result?.permanent),
+    retryAfterSeconds: nonNegativeInteger(result?.retryAfterSeconds),
+    error: sanitizeTelegramLogValue(
+      result?.error || 'Unknown Telegram API error',
+      token,
+      sensitiveValues
+    )
+  };
+
+  const source = sanitizeTelegramLogValue(
+    context?.source || '',
+    token,
+    sensitiveValues
+  );
+  if (source) {
+    details.source = source;
+  }
+
+  const diagnostic = normalizeTelegramDiagnostic(
+    result?.diagnostic,
+    token,
+    sensitiveValues
+  );
+  if (diagnostic) {
+    Object.assign(details, diagnostic);
+  }
+
+  for (const key of ['deliveryId', 'attempt', 'maxAttempts']) {
+    const value = nonNegativeIntegerOrNull(context?.[key]);
+    if (value !== null) {
+      details[key] = value;
+    }
+  }
+  if (typeof context?.exhausted === 'boolean') {
+    details.exhausted = context.exhausted;
+  }
+  return details;
+}
+
+/**
+ * Redact before truncating. This ordering prevents a token crossing the
+ * truncation boundary from leaving a partial secret in logs or D1.
+ */
+export function sanitizeTelegramLogValue(value, token = '', sensitiveValues = []) {
+  let normalized = safeString(value);
+  const rawSecrets = [
+    safeString(token),
+    ...(Array.isArray(sensitiveValues)
+      ? sensitiveValues.map((entry) => safeString(entry))
+      : [])
+  ];
+  const secrets = new Set(rawSecrets.flatMap(sensitiveStringVariants));
+  for (const secret of [...secrets].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    normalized = normalized.replaceAll(secret, '[REDACTED]');
+  }
+
+  normalized = normalized
+    .replace(
+      /https?:\/\/api\.telegram\.org\/bot[^\s/?#]+\/[^\s?#]*/gi,
+      '[REDACTED_TELEGRAM_URL]'
+    )
+    .replace(
+      /\/bot[0-9A-Za-z:_-]+\/[A-Za-z][A-Za-z0-9_]*/g,
+      '/bot[REDACTED]/[METHOD]'
+    )
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[REDACTED_URL]')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ');
+  return normalized.slice(0, MAX_DIAGNOSTIC_TEXT_LENGTH);
+}
+
 async function callTelegramApi(token, method, payload, { fetchFn = globalThis.fetch, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
   if (!String(token ?? '').trim()) {
     return localFailure('Telegram bot token is required');
@@ -130,6 +243,12 @@ async function callTelegramApi(token, method, payload, { fetchFn = globalThis.fe
     return localFailure('timeoutMs must be a positive integer');
   }
   const controller = new AbortController();
+  const startedAt = Date.now();
+  const sensitiveValues = collectPayloadSensitiveValues(payload);
+  let failurePhase = 'fetch';
+  let upstreamStatus = 0;
+  let responseContentType = '';
+  let responseBodyLength = 0;
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
@@ -140,34 +259,119 @@ async function callTelegramApi(token, method, payload, { fetchFn = globalThis.fe
     const response = await fetchFn(`${TELEGRAM_API_BASE}/bot${token}/${method}`, {
       method: 'POST',
       signal: controller.signal,
-      redirect: 'error',
+      redirect: 'manual',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
 
+    failurePhase = 'response_validate';
     if (!response || typeof response.ok !== 'boolean') {
-      return networkFailure('Telegram returned an invalid response');
+      return networkFailure(
+        'Telegram returned an invalid response',
+        createTelegramDiagnostic({
+          failureKind: 'invalid_response',
+          failurePhase,
+          startedAt,
+          timeoutMs: safeTimeoutMs,
+          token,
+          sensitiveValues
+        })
+      );
     }
 
-    const status = Number(response.status) || (response.ok ? 200 : 0);
+    upstreamStatus = Number(response.status) || (response.ok ? 200 : 0);
+    responseContentType = sanitizeTelegramLogValue(
+      response.headers?.get?.('content-type') || '',
+      token,
+      sensitiveValues
+    ).slice(0, 120);
+
+    if (upstreamStatus >= 300 && upstreamStatus < 400) {
+      failurePhase = 'redirect';
+      const redirectHost = redirectHostnameFromLocation(
+        response.headers?.get?.('location')
+      );
+      return networkFailure(
+        'Telegram returned an unexpected redirect',
+        createTelegramDiagnostic({
+          failureKind: 'unexpected_redirect',
+          failurePhase,
+          startedAt,
+          timeoutMs: safeTimeoutMs,
+          upstreamStatus,
+          redirectHost,
+          responseContentType,
+          token,
+          sensitiveValues
+        }),
+        upstreamStatus
+      );
+    }
+
     if (typeof response.text !== 'function') {
-      return {
-        ...networkFailure('Telegram returned an invalid response'),
-        status
-      };
+      return networkFailure(
+        'Telegram returned an invalid response',
+        createTelegramDiagnostic({
+          failureKind: 'invalid_response',
+          failurePhase,
+          startedAt,
+          timeoutMs: safeTimeoutMs,
+          upstreamStatus,
+          responseContentType,
+          token,
+          sensitiveValues
+        }),
+        upstreamStatus
+      );
     }
+
+    failurePhase = 'response_body';
     const rawBody = await response.text();
-    const body = parseJsonSafely(rawBody);
-    if (response.ok && body?.ok !== true) {
-      return {
-        ...networkFailure('Telegram returned an invalid response'),
-        status
-      };
+    responseBodyLength = String(rawBody ?? '').length;
+    failurePhase = 'response_parse';
+    const parsedBody = parseJsonSafely(rawBody);
+    const body = parsedBody.value;
+    if (response.ok && !parsedBody.ok) {
+      return networkFailure(
+        'Telegram returned invalid JSON',
+        createTelegramDiagnostic({
+          failureKind: 'invalid_json',
+          failurePhase,
+          startedAt,
+          timeoutMs: safeTimeoutMs,
+          upstreamStatus,
+          responseContentType,
+          responseBodyLength,
+          token,
+          sensitiveValues
+        }),
+        upstreamStatus
+      );
     }
+
+    failurePhase = 'response_validate';
+    if (response.ok && body?.ok !== true) {
+      return networkFailure(
+        'Telegram returned an invalid response',
+        createTelegramDiagnostic({
+          failureKind: 'invalid_api_response',
+          failurePhase,
+          startedAt,
+          timeoutMs: safeTimeoutMs,
+          upstreamStatus,
+          responseContentType,
+          responseBodyLength,
+          token,
+          sensitiveValues
+        }),
+        upstreamStatus
+      );
+    }
+
     if (response.ok) {
       return {
         ok: true,
-        status,
+        status: upstreamStatus,
         retryable: false,
         permanent: false,
         retryAfterSeconds: 0,
@@ -177,22 +381,49 @@ async function callTelegramApi(token, method, payload, { fetchFn = globalThis.fe
     }
 
     const retryAfterSeconds = extractRetryAfterSeconds(body, response);
-    const retryable = isRetryableStatus(status);
-    const description = String(body?.description || rawBody || `Telegram HTTP ${status}`).trim();
+    const retryable = isRetryableStatus(upstreamStatus);
+    const description = `Telegram HTTP ${upstreamStatus}`;
     return {
       ok: false,
-      status,
+      status: upstreamStatus,
       retryable,
       permanent: !retryable,
       retryAfterSeconds,
       error: description,
-      result: null
+      result: null,
+      diagnostic: createTelegramDiagnostic({
+        failureKind: 'http_error',
+        failurePhase,
+        startedAt,
+        timeoutMs: safeTimeoutMs,
+        upstreamStatus,
+        responseContentType,
+        responseBodyLength,
+        token,
+        sensitiveValues
+      })
     };
-  } catch {
+  } catch (error) {
     const message = timedOut
       ? `Telegram request timed out after ${safeTimeoutMs}ms`
       : 'Telegram network request failed';
-    return networkFailure(message);
+    return networkFailure(
+      message,
+      createTelegramDiagnostic({
+        failureKind: timedOut ? 'timeout' : 'network_exception',
+        failurePhase,
+        startedAt,
+        timeoutMs: safeTimeoutMs,
+        upstreamStatus,
+        responseContentType,
+        responseBodyLength,
+        timedOut,
+        error,
+        token,
+        sensitiveValues
+      }),
+      upstreamStatus
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -210,16 +441,279 @@ function localFailure(error) {
   };
 }
 
-function networkFailure(error) {
+function networkFailure(error, diagnostic = null, status = 0) {
   return {
     ok: false,
-    status: 0,
+    status: nonNegativeInteger(status),
     retryable: true,
     permanent: false,
     retryAfterSeconds: 0,
     error,
-    result: null
+    result: null,
+    ...(diagnostic ? { diagnostic } : {})
   };
+}
+
+function createTelegramDiagnostic({
+  failureKind,
+  failurePhase,
+  startedAt,
+  timeoutMs,
+  upstreamStatus = 0,
+  redirectHost = null,
+  responseContentType = '',
+  responseBodyLength = 0,
+  timedOut = false,
+  error = null,
+  token = '',
+  sensitiveValues = []
+}) {
+  const exception = extractExceptionDetails(error, token, sensitiveValues);
+  const normalizedRedirectHost = normalizeHostname(redirectHost);
+  return {
+    failureKind: TELEGRAM_FAILURE_KINDS.has(failureKind)
+      ? failureKind
+      : 'network_exception',
+    failurePhase: TELEGRAM_FAILURE_PHASES.has(failurePhase)
+      ? failurePhase
+      : 'fetch',
+    durationMs: elapsedMilliseconds(startedAt),
+    timeoutMs: nonNegativeInteger(timeoutMs),
+    upstreamHost: TELEGRAM_API_HOST,
+    upstreamStatus: nonNegativeInteger(upstreamStatus),
+    ...(normalizedRedirectHost
+      ? { redirectHost: normalizedRedirectHost }
+      : {}),
+    responseContentType: responseContentType || null,
+    responseBodyLength: nonNegativeInteger(responseBodyLength),
+    timedOut: Boolean(timedOut),
+    ...exception
+  };
+}
+
+function extractExceptionDetails(error, token, sensitiveValues) {
+  if (error === null || error === undefined) {
+    return {
+      exceptionName: null,
+      exceptionMessage: null,
+      causeName: null,
+      causeCode: null,
+      causeMessage: null
+    };
+  }
+
+  const cause = safeProperty(error, 'cause');
+  return {
+    exceptionName: nullableSanitizedValue(
+      safeProperty(error, 'name') ||
+        (error instanceof Error ? error.constructor?.name : 'ThrownValue'),
+      token,
+      sensitiveValues
+    ),
+    exceptionMessage: nullableSanitizedValue(
+      safeProperty(error, 'message') || safeString(error),
+      token,
+      sensitiveValues
+    ),
+    causeName: nullableSanitizedValue(
+      safeProperty(cause, 'name'),
+      token,
+      sensitiveValues
+    ),
+    causeCode: nullableSanitizedValue(
+      safeProperty(cause, 'code'),
+      token,
+      sensitiveValues
+    ),
+    causeMessage: nullableSanitizedValue(
+      safeProperty(cause, 'message'),
+      token,
+      sensitiveValues
+    )
+  };
+}
+
+function normalizeTelegramDiagnostic(value, token, sensitiveValues) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const redirectHost = normalizeHostname(value.redirectHost);
+  return {
+    failureKind: TELEGRAM_FAILURE_KINDS.has(value.failureKind)
+      ? value.failureKind
+      : 'network_exception',
+    failurePhase: TELEGRAM_FAILURE_PHASES.has(value.failurePhase)
+      ? value.failurePhase
+      : 'fetch',
+    durationMs: nonNegativeInteger(value.durationMs),
+    timeoutMs: nonNegativeInteger(value.timeoutMs),
+    upstreamHost: TELEGRAM_API_HOST,
+    upstreamStatus: nonNegativeInteger(value.upstreamStatus),
+    ...(redirectHost ? { redirectHost } : {}),
+    responseContentType: nullableSanitizedValue(
+      value.responseContentType,
+      token,
+      sensitiveValues
+    ),
+    responseBodyLength: nonNegativeInteger(value.responseBodyLength),
+    timedOut: Boolean(value.timedOut),
+    exceptionName: nullableSanitizedValue(
+      value.exceptionName,
+      token,
+      sensitiveValues
+    ),
+    exceptionMessage: nullableSanitizedValue(
+      value.exceptionMessage,
+      token,
+      sensitiveValues
+    ),
+    causeName: nullableSanitizedValue(
+      value.causeName,
+      token,
+      sensitiveValues
+    ),
+    causeCode: nullableSanitizedValue(
+      value.causeCode,
+      token,
+      sensitiveValues
+    ),
+    causeMessage: nullableSanitizedValue(
+      value.causeMessage,
+      token,
+      sensitiveValues
+    )
+  };
+}
+
+function collectPayloadSensitiveValues(payload) {
+  const values = [];
+  for (const key of ['text', 'chat_id', 'user_id', 'callback_query_id']) {
+    if (payload?.[key] !== null && payload?.[key] !== undefined) {
+      values.push(payload[key]);
+    }
+  }
+  collectNestedPrimitiveValues(payload?.reply_markup, values, 0);
+  return values;
+}
+
+function collectNestedPrimitiveValues(value, output, depth) {
+  if (output.length >= 64 || depth > 5 || value === null || value === undefined) {
+    return;
+  }
+  if (typeof value === 'string' || typeof value === 'number') {
+    output.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectNestedPrimitiveValues(entry, output, depth + 1);
+    }
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const entry of Object.values(value)) {
+      collectNestedPrimitiveValues(entry, output, depth + 1);
+    }
+  }
+}
+
+function redirectHostnameFromLocation(value) {
+  const location = safeString(value).trim();
+  if (!location) {
+    return null;
+  }
+  try {
+    return normalizeHostname(new URL(location, TELEGRAM_API_BASE).hostname);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHostname(value) {
+  const hostname = safeString(value).trim().toLowerCase();
+  if (!hostname || hostname.length > 253) {
+    return null;
+  }
+  const labels = hostname.split('.');
+  if (labels.some((label) =>
+    !label ||
+    label.length > 63 ||
+    !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
+  )) {
+    return null;
+  }
+  return hostname;
+}
+
+function nullableSanitizedValue(value, token, sensitiveValues) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  return sanitizeTelegramLogValue(value, token, sensitiveValues) || null;
+}
+
+function safeProperty(value, key) {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) {
+    return null;
+  }
+  try {
+    return value[key];
+  } catch {
+    return null;
+  }
+}
+
+function safeString(value) {
+  try {
+    return String(value ?? '');
+  } catch {
+    return '[Unprintable value]';
+  }
+}
+
+function sensitiveStringVariants(value) {
+  const normalized = safeString(value);
+  if (!normalized) {
+    return [];
+  }
+  const variants = [normalized, safelyEncodeURIComponent(normalized)];
+  try {
+    const serialized = JSON.stringify(normalized);
+    if (typeof serialized === 'string' && serialized.length >= 2) {
+      variants.push(serialized.slice(1, -1));
+    }
+  } catch {
+    // safeString already produced the raw fallback variant.
+  }
+  return variants;
+}
+
+function safelyEncodeURIComponent(value) {
+  try {
+    return encodeURIComponent(safeString(value));
+  } catch {
+    return '';
+  }
+}
+
+function elapsedMilliseconds(startedAt) {
+  const start = Number(startedAt);
+  return Number.isFinite(start)
+    ? Math.max(0, Math.round(Date.now() - start))
+    : 0;
+}
+
+function nonNegativeInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.round(number) : 0;
+}
+
+function nonNegativeIntegerOrNull(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
 }
 
 function isRetryableStatus(status) {
@@ -253,9 +747,9 @@ function extractRetryAfterSeconds(body, response) {
 
 function parseJsonSafely(value) {
   try {
-    return value ? JSON.parse(value) : null;
+    return { ok: true, value: JSON.parse(value) };
   } catch {
-    return null;
+    return { ok: false, value: null };
   }
 }
 

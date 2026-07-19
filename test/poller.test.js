@@ -341,6 +341,7 @@ test('classifies successful, retryable, permanent, and rate-limited deliveries',
   const sentMessages = [];
   const markedSent = [];
   const markedRetry = [];
+  const logs = [];
 
   const stats = await runScheduled(
     { DB },
@@ -349,11 +350,11 @@ test('classifies successful, retryable, permanent, and rate-limited deliveries',
       listPendingDeliveries: async (_env, limit) => {
         assert.equal(limit, 5);
         return [
-          { id: 1, chatId: '1', threadId: null, message: 'm1', attempts: 0 },
-          { id: 2, chatId: '2', threadId: null, message: 'm2', attempts: 2 },
-          { id: 3, chatId: '3', threadId: null, message: 'm3', attempts: 0 },
-          { id: 4, chatId: '4', threadId: null, message: 'm4', attempts: 4 },
-          { id: 5, chatId: '5', threadId: null, message: 'm5', attempts: 0 }
+          { id: 1, chatId: '900000001', threadId: null, message: 'm1', attempts: 0 },
+          { id: 2, chatId: '900000002', threadId: null, message: 'm2', attempts: 2 },
+          { id: 3, chatId: '900000003', threadId: null, message: 'm3', attempts: 0 },
+          { id: 4, chatId: '900000004', threadId: null, message: 'm4', attempts: 4 },
+          { id: 5, chatId: '900000005', threadId: null, message: 'm5', attempts: 0 }
         ];
       },
       sendTelegramMessage: async (_token, _chatId, _threadId, message) => {
@@ -367,6 +368,12 @@ test('classifies successful, retryable, permanent, and rate-limited deliveries',
       markDeliveryRetry: async (_env, id, state) => {
         markedRetry.push([id, state]);
         return true;
+      },
+      logger: {
+        error(details) {
+          logs.push(details);
+        },
+        warn() {}
       }
     })
   );
@@ -388,6 +395,43 @@ test('classifies successful, retryable, permanent, and rate-limited deliveries',
     },
     { processed: 4, sent: 1, retried: 2, dead: 1, rateLimited: true }
   );
+  assert.deepEqual(
+    logs.map((entry) => ({
+      message: entry.message,
+      source: entry.source,
+      operation: entry.operation,
+      deliveryId: entry.deliveryId,
+      attempt: entry.attempt,
+      maxAttempts: entry.maxAttempts,
+      exhausted: entry.exhausted,
+      status: entry.status,
+      retryable: entry.retryable,
+      permanent: entry.permanent,
+      retryAfterSeconds: entry.retryAfterSeconds,
+      error: entry.error
+    })),
+    [
+      {
+        message: 'Telegram delivery failed.', source: 'scheduled',
+        operation: 'sendMessage', deliveryId: 2, attempt: 3, maxAttempts: 10,
+        exhausted: false, status: 500, retryable: true, permanent: false,
+        retryAfterSeconds: 120, error: 'server'
+      },
+      {
+        message: 'Telegram delivery failed.', source: 'scheduled',
+        operation: 'sendMessage', deliveryId: 3, attempt: 1, maxAttempts: 10,
+        exhausted: false, status: 400, retryable: false, permanent: true,
+        retryAfterSeconds: 0, error: 'bad chat'
+      },
+      {
+        message: 'Telegram delivery failed.', source: 'scheduled',
+        operation: 'sendMessage', deliveryId: 4, attempt: 5, maxAttempts: 10,
+        exhausted: false, status: 429, retryable: true, permanent: false,
+        retryAfterSeconds: 17, error: 'slow down'
+      }
+    ]
+  );
+  assert.doesNotMatch(JSON.stringify(logs), /90000000[1-5]|"m[1-5]"/);
 });
 
 test('a failed item enqueue is isolated and is not recorded in sent history', async () => {
@@ -594,6 +638,7 @@ test('caps rotated feeds per run and advances the cursor by the selected count',
 
 test('dead-letters a retryable delivery when the current failure reaches the attempt ceiling', async () => {
   const marked = [];
+  const logs = [];
   const stats = await runScheduled(
     { DB: new FakeKv() },
     { ...BASE_CONFIG, maxDeliveryAttempts: 3 },
@@ -617,6 +662,12 @@ test('dead-letters a retryable delivery when the current failure reaches the att
       markDeliveryRetry: async (_env, id, state) => {
         marked.push([id, state]);
         return true;
+      },
+      logger: {
+        error(details) {
+          logs.push(details);
+        },
+        warn() {}
       }
     })
   );
@@ -633,6 +684,105 @@ test('dead-letters a retryable delivery when the current failure reaches the att
       }
     ]
   ]);
+  assert.equal(logs.length, 1);
+  assert.deepEqual(
+    {
+      deliveryId: logs[0].deliveryId,
+      attempt: logs[0].attempt,
+      maxAttempts: logs[0].maxAttempts,
+      exhausted: logs[0].exhausted,
+      permanent: logs[0].permanent,
+      retryAfterSeconds: logs[0].retryAfterSeconds
+    },
+    {
+      deliveryId: 41,
+      attempt: 3,
+      maxAttempts: 3,
+      exhausted: true,
+      permanent: true,
+      retryAfterSeconds: 0
+    }
+  );
+});
+
+test('logs and sanitizes thrown sends before a retry-state write can fail', async () => {
+  const token = '999999:poller-secret';
+  const chatId = '-1005555555555';
+  const threadId = '777777';
+  const message = 'private delivery payload';
+  const logs = [];
+  const retryStates = [];
+  const cause = new Error(`cause for ${threadId} and ${token}`);
+  cause.code = 'ECONNRESET';
+  const thrown = new TypeError(
+    `failed https://api.telegram.org/bot${token}/sendMessage for ${chatId} ${message}`,
+    { cause }
+  );
+
+  await assert.rejects(
+    runScheduled(
+      { DB: new FakeKv() },
+      { ...BASE_CONFIG, telegramBotToken: token },
+      baseDependencies({
+        listPendingDeliveries: async () => [{
+          id: 91,
+          chatId,
+          threadId,
+          message,
+          attempts: 0
+        }],
+        sendTelegramMessage: async () => {
+          throw thrown;
+        },
+        markDeliveryRetry: async (_env, id, state) => {
+          retryStates.push([id, state]);
+          throw new Error('D1 retry-state write failed');
+        },
+        logger: {
+          error(details) {
+            logs.push(details);
+          },
+          warn() {}
+        }
+      })
+    ),
+    /D1 retry-state write failed/
+  );
+
+  assert.equal(logs.length, 1);
+  assert.deepEqual(
+    {
+      source: logs[0].source,
+      operation: logs[0].operation,
+      deliveryId: logs[0].deliveryId,
+      attempt: logs[0].attempt,
+      exhausted: logs[0].exhausted,
+      failureKind: logs[0].failureKind,
+      failurePhase: logs[0].failurePhase,
+      exceptionName: logs[0].exceptionName,
+      causeCode: logs[0].causeCode
+    },
+    {
+      source: 'scheduled',
+      operation: 'sendMessage',
+      deliveryId: 91,
+      attempt: 1,
+      exhausted: false,
+      failureKind: 'caller_exception',
+      failurePhase: 'send',
+      exceptionName: 'TypeError',
+      causeCode: 'ECONNRESET'
+    }
+  );
+  assert.equal(retryStates.length, 1);
+  const serializedLogs = JSON.stringify(logs);
+  const serializedState = JSON.stringify(retryStates);
+  for (const secret of [token, chatId, threadId, message]) {
+    assert.equal(serializedLogs.includes(secret), false);
+    assert.equal(serializedState.includes(secret), false);
+  }
+  assert.doesNotMatch(serializedLogs, /api\.telegram\.org\/bot|stack/i);
+  assert.doesNotMatch(serializedState, /api\.telegram\.org\/bot/);
 });
 
 test('persists stable aliases so changed or missing GUIDs with the same link are not duplicated', async () => {

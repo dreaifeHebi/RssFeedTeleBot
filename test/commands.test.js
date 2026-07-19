@@ -135,7 +135,28 @@ test('command reply failures emit structured logs without exposing the bot token
         retryable: false,
         permanent: true,
         retryAfterSeconds: 0,
-        error: 'Unauthorized for ' + token
+        error: 'Unauthorized for ' + token,
+        url: 'https://api.telegram.org/bot' + token + '/sendMessage',
+        payload: 'sensitive-payload',
+        stack: 'sensitive stack ' + token,
+        diagnostic: {
+          failureKind: 'network_exception',
+          failurePhase: 'fetch',
+          durationMs: 7,
+          timeoutMs: 10_000,
+          upstreamHost: 'untrusted.example',
+          upstreamStatus: 0,
+          responseContentType: null,
+          responseBodyLength: 0,
+          timedOut: false,
+          exceptionName: 'TypeError',
+          exceptionMessage: 'failed for ' + token,
+          causeName: 'Error',
+          causeCode: 'ECONNRESET',
+          causeMessage:
+            'https://api.telegram.org/bot' + token + '/sendMessage',
+          stack: 'must never be logged'
+        }
       };
     },
     logTelegramError(details) {
@@ -157,9 +178,99 @@ test('command reply failures emit structured logs without exposing the bot token
     retryable: false,
     permanent: true,
     retryAfterSeconds: 0,
-    error: 'Unauthorized for [REDACTED]'
+    error: 'Unauthorized for [REDACTED]',
+    source: 'webhook',
+    failureKind: 'network_exception',
+    failurePhase: 'fetch',
+    durationMs: 7,
+    timeoutMs: 10_000,
+    upstreamHost: 'api.telegram.org',
+    upstreamStatus: 0,
+    responseContentType: null,
+    responseBodyLength: 0,
+    timedOut: false,
+    exceptionName: 'TypeError',
+    exceptionMessage: 'failed for [REDACTED]',
+    causeName: 'Error',
+    causeCode: 'ECONNRESET',
+    causeMessage: '[REDACTED_TELEGRAM_URL]'
   }]);
+  const serialized = JSON.stringify(logs);
+  assert.doesNotMatch(serialized, new RegExp(token));
+  assert.doesNotMatch(serialized, /sensitive-payload|sensitive stack|untrusted/);
+  assert.doesNotMatch(serialized, /api\.telegram\.org\/bot/);
+});
+
+test('getChatMember failures are logged before permission checks fail closed', async () => {
+  const token = 'member-check-token-must-not-leak';
+  const logs = [];
+  const harness = makeHarness({
+    async getChatMember() {
+      return {
+        ok: false,
+        status: 0,
+        retryable: true,
+        permanent: false,
+        retryAfterSeconds: 0,
+        error:
+          'fetch failed https://api.telegram.org/bot' +
+          token +
+          '/getChatMember',
+        diagnostic: {
+          failureKind: 'network_exception',
+          failurePhase: 'fetch',
+          durationMs: 11,
+          timeoutMs: 10_000,
+          upstreamStatus: 0,
+          responseContentType: null,
+          responseBodyLength: 0,
+          timedOut: false,
+          exceptionName: 'TypeError',
+          exceptionMessage: 'fetch failed for ' + token,
+          causeName: null,
+          causeCode: null,
+          causeMessage: null
+        }
+      };
+    },
+    logTelegramError(details) {
+      logs.push(details);
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/add rss https://feeds.example/rss', {
+      chat: { id: '-100123456789', type: 'supergroup' }
+    }),
+    { DB: makeKv() },
+    makeConfig({
+      telegramBotToken: token,
+      adminUserIds: new Set(),
+      allowedFeedHosts: new Set(['feeds.example'])
+    }),
+    harness.services
+  );
+
+  assert.equal(logs.length, 1);
+  assert.deepEqual(
+    {
+      source: logs[0].source,
+      operation: logs[0].operation,
+      failureKind: logs[0].failureKind,
+      failurePhase: logs[0].failurePhase,
+      exceptionName: logs[0].exceptionName
+    },
+    {
+      source: 'webhook',
+      operation: 'getChatMember',
+      failureKind: 'network_exception',
+      failurePhase: 'fetch',
+      exceptionName: 'TypeError'
+    }
+  );
+  assert.match(harness.messages.at(-1).text, /do not have permission/);
   assert.doesNotMatch(JSON.stringify(logs), new RegExp(token));
+  assert.doesNotMatch(JSON.stringify(logs), /api\.telegram\.org\/bot/);
 });
 
 test('add applies the feed host allowlist and escapes dynamic HTML', async () => {

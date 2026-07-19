@@ -11,6 +11,7 @@ import {
 } from './feeds.js';
 import {
   answerCallbackQuery,
+  buildTelegramFailureLogDetails,
   escapeHtml,
   getChatMember,
   sendTelegramMessage
@@ -31,6 +32,7 @@ const MAX_LIST_MESSAGE_LENGTH = 3900;
 const DEFAULT_SERVICES = Object.freeze({
   addSubscription,
   answerCallbackQuery,
+  buildTelegramFailureLogDetails,
   buildRssHubUrl,
   canManageChat,
   canManageTargetChat,
@@ -579,6 +581,12 @@ async function lookupChatMember(context, chatId, userId) {
     telegramOptions(context.services)
   );
   if (result?.ok === false) {
+    reportTelegramFailure(
+      context.services,
+      context.token,
+      'getChatMember',
+      result
+    );
     throw new Error(result.error || 'Telegram getChatMember failed');
   }
   return result?.member ?? result?.result ?? result;
@@ -657,30 +665,15 @@ function reportTelegramFailure(services, token, operation, result) {
     return;
   }
 
-  services.logTelegramError({
-    message: 'Telegram API request failed.',
-    operation,
-    status: Number(result?.status) || 0,
-    retryable: Boolean(result?.retryable),
-    permanent: Boolean(result?.permanent),
-    retryAfterSeconds: Number(result?.retryAfterSeconds) || 0,
-    error: redactLogValue(
-      result?.error || 'Unknown Telegram API error',
-      token
-    )
-  });
+  services.logTelegramError(
+    services.buildTelegramFailureLogDetails(token, operation, result, {
+      source: 'webhook'
+    })
+  );
 }
 
 function logTelegramError(details) {
-  console.error(JSON.stringify(details));
-}
-
-function redactLogValue(value, secret) {
-  const normalized = String(value ?? '')
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .slice(0, 500);
-  const sensitive = String(secret ?? '');
-  return sensitive ? normalized.replaceAll(sensitive, '[REDACTED]') : normalized;
+  console.error(details);
 }
 
 function telegramOptions(services) {

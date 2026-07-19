@@ -124,6 +124,44 @@ test('management commands deny a group member and allow an administrator', async
   assert.doesNotMatch(allowed.messages.at(-1).text, /secret-token/);
 });
 
+test('command reply failures emit structured logs without exposing the bot token', async () => {
+  const logs = [];
+  const token = 'test-token-must-not-leak';
+  const harness = makeHarness({
+    async sendTelegramMessage() {
+      return {
+        ok: false,
+        status: 401,
+        retryable: false,
+        permanent: true,
+        retryAfterSeconds: 0,
+        error: 'Unauthorized for ' + token
+      };
+    },
+    logTelegramError(details) {
+      logs.push(details);
+    }
+  });
+
+  await handleMessage(
+    makeMessage('/start'),
+    { DB: makeKv() },
+    makeConfig({ telegramBotToken: token }),
+    harness.services
+  );
+
+  assert.deepEqual(logs, [{
+    message: 'Telegram API request failed.',
+    operation: 'sendMessage',
+    status: 401,
+    retryable: false,
+    permanent: true,
+    retryAfterSeconds: 0,
+    error: 'Unauthorized for [REDACTED]'
+  }]);
+  assert.doesNotMatch(JSON.stringify(logs), new RegExp(token));
+});
+
 test('add applies the feed host allowlist and escapes dynamic HTML', async () => {
   let added;
   const harness = makeHarness({

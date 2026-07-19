@@ -40,6 +40,7 @@ const DEFAULT_SERVICES = Object.freeze({
   inferTypeFromRssUrl,
   isManagementCommand,
   listSubscriptions,
+  logTelegramError,
   parseCommand,
   removeSubscriptions,
   sendTelegramMessage,
@@ -213,7 +214,7 @@ export async function handleCallback(callbackQuery, env, config, overrides = {})
 
   if (added > 0) {
     await answer(services, token, callbackQuery, '✅ Forwarded ' + added + ' subscriptions!');
-    await services.sendTelegramMessage(
+    const result = await services.sendTelegramMessage(
       token,
       String(callbackQuery.message.chat.id),
       optionalId(session.sourceThreadId),
@@ -221,6 +222,7 @@ export async function handleCallback(callbackQuery, env, config, overrides = {})
       null,
       telegramOptions(services)
     );
+    reportTelegramFailure(services, token, 'sendMessage', result);
   } else {
     await answer(services, token, callbackQuery, '⚠️ Channels already exist in target.');
   }
@@ -599,7 +601,7 @@ async function authorizeTargetChat(context, targetChatId) {
 }
 
 async function send(context, text, replyMarkup = null) {
-  return context.services.sendTelegramMessage(
+  const result = await context.services.sendTelegramMessage(
     context.token,
     context.chatId,
     context.threadId,
@@ -607,6 +609,13 @@ async function send(context, text, replyMarkup = null) {
     replyMarkup,
     telegramOptions(context.services)
   );
+  reportTelegramFailure(
+    context.services,
+    context.token,
+    'sendMessage',
+    result
+  );
+  return result;
 }
 
 async function sendList(
@@ -633,12 +642,45 @@ async function answer(services, token, callbackQuery, text) {
   if (callbackQuery?.id === null || callbackQuery?.id === undefined) {
     return null;
   }
-  return services.answerCallbackQuery(
+  const result = await services.answerCallbackQuery(
     token,
     String(callbackQuery.id),
     text,
     telegramOptions(services)
   );
+  reportTelegramFailure(services, token, 'answerCallbackQuery', result);
+  return result;
+}
+
+function reportTelegramFailure(services, token, operation, result) {
+  if (result?.ok === true) {
+    return;
+  }
+
+  services.logTelegramError({
+    message: 'Telegram API request failed.',
+    operation,
+    status: Number(result?.status) || 0,
+    retryable: Boolean(result?.retryable),
+    permanent: Boolean(result?.permanent),
+    retryAfterSeconds: Number(result?.retryAfterSeconds) || 0,
+    error: redactLogValue(
+      result?.error || 'Unknown Telegram API error',
+      token
+    )
+  });
+}
+
+function logTelegramError(details) {
+  console.error(JSON.stringify(details));
+}
+
+function redactLogValue(value, secret) {
+  const normalized = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .slice(0, 500);
+  const sensitive = String(secret ?? '');
+  return sensitive ? normalized.replaceAll(sensitive, '[REDACTED]') : normalized;
 }
 
 function telegramOptions(services) {

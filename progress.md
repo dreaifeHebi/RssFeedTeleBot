@@ -200,3 +200,49 @@
 - 本地运行时为 Node.js v24.16.0，node:sqlite 可用；可增加迁移 SQL 的真实数据库回归测试，不引入新依赖。
 - 已定位 commands 的 ForceReply、输入绑定、逐订阅路由详情、旧复制 session 回调与测试夹具；下一步按复审项补交互和回归测试。
 - 修正方案已收敛：去掉 selective ForceReply；群聊缺失 prompt message_id 时失效；继承重复目标保持继承；新增 source-only action；复制 session 用全局索引分页且翻页不消费 session。
+
+---
+
+## Session: 2026-07-20 — single-message management panel
+
+- **Status:** complete
+- 用户要求菜单按钮操作尽量保持在同一条 Telegram 消息内。
+- 已恢复现有规划记录并确认工作区与 origin/master 一致、无未提交改动。
+- 已启动 commands.js / commands.test.js 的只读交互路径审计。
+- 已确认 ui:* 与 fwd:* 翻页均通过 sendMessage 新增消息；下一步实现统一 edit-or-send 渲染和 Telegram API 包装。
+- 规划写入期间内置 apply_patch 因 bwrap 网络命名空间故障不可用，已按既有安全兜底使用固定内容、路径限定补丁并记录全部失败。
+- S1 审计完成：已覆盖 ui:* 导航、状态操作、文本输入和旧 fwd:* 翻页/完成路径；进入统一渲染与兼容降级设计。
+- S2 完成：确定 panel message_id/session 绑定、render fingerprint、确定性重建、临时 ForceReply 清理和 fwd selector 复用方案；进入 S3。
+- telegram.js 已增加 editMessageText/deleteMessage 包装、message_id 校验和脱敏 apiDescription；node --check 通过。
+- commands.js 已接入 edit/delete 服务、UI session panelMessageId 校验和 renderUiPanel；主页、添加菜单、订阅列表/详情/删除确认已改为原消息编辑，语法检查通过。
+- 所有订阅删除、源投递切换、仅源、目标删除和恢复继承已从“状态消息 + 详情消息”合并成一次带 notice 的面板编辑；commands.js 语法通过。
+- 输入说明现显示在主面板，ForceReply 缩短为临时提示；输入错误编辑面板，成功后 best-effort 删除 prompt/用户输入。一次字段逗号错误已由 node --check 发现并修复。
+- 独立转发目标输入已不再发送错误/状态消息，全部复用主面板；/cancel 会清理临时 ForceReply 并编辑回主页。commands.js 语法通过。
+- 旧 fwd:* 复制选择器现保存 selectorMessageId，翻页和完成均编辑原消息，完成后移除旧按钮；UI 发起时同步 canonical panel ID。
+- 定向 commands 测试在修复 helper 作用域和兼容断言后 21/21 通过。
+- 新增 4 个 commands 单消息回归与 2 个 telegram edit/delete/脱敏测试；定向 commands + telegram 共 43/43 通过，进入文档与全量验证。
+- 双语 README 已说明主面板原消息编辑、临时 ForceReply 和 best-effort 清理边界；git diff --check 通过，工作区仅含本次相关文件。
+- 已对照 Telegram Bot API 10.2 核实编辑/删除语义；临时 prompt 与用户输入并行 best-effort 删除，单次清理请求超时 2.5 秒。
+- UI/input/forward 权威会话和 panel lease 已迁入 D1；当前键盘 allowlist、一次性 nonce、owner lease 与 exact CAS 可阻止旧按钮及失去租约的 Worker 覆盖新状态。
+- 父 UI TTL 会覆盖 ForceReply 的最终输入窗口；输入入口、429/503、stale render、ForceReply 后接管、nonce replay 与 cancel CAS=0 的确定性回归均已通过。
+- 最终只读复审未发现剩余 P1/P2；commands 64/64、全套 162/162、`npm run check`、`git diff --check` 均通过。
+- Wrangler 4.111.0 dry-run 通过：393.24 KiB / gzip 85.73 KiB。未提交、推送或部署生产。
+
+---
+
+## Session: 2026-07-20 — default forwarding menu
+
+- **Status:** complete
+- 已确认默认转发后端、KV 与 Poller 完整，但菜单只有逐订阅入口。
+- 已读取 planning-with-files 与 workers-best-practices，并核对最新 Cloudflare 官方最佳实践、Workers 类型和本地 Wrangler schema。
+- 已确定两级转发入口、Topic/Global scope、ForceReply 输入、权限重验和 nonce 删除确认方案。
+- 已实现“消息转发 → 默认转发 / 分别管理”入口、Topic/Global 状态页和设置模式选择。
+- 默认目标输入已接入现有 ForceReply claim/CAS 与权限重验；删除确认绑定 nonce 和配置版本，结果继续编辑 canonical panel。
+- 已新增入口/单消息、Global 写入、Topic/Global 展示、目标权限拒绝、配置变更检测、删除回放和输入入口租约测试；commands 69/69 passed。
+- 旧逐订阅测试已改为先进入新的转发 hub；新增测试均恢复为顶层测试。
+- Bot 帮助与中英文 README 已补齐“消息转发 → 默认转发 / 分别管理”路径、作用域优先级和命令快捷方式。
+- D3 完成，进入全量测试、Workers 最佳实践复核与 Wrangler dry-run。
+- 全量 `npm test` 167/167、`npm run check` 与 `git diff --check` 通过。
+- Wrangler 4.111.0 dry-run 通过：406.54 KiB / gzip 87.91 KiB；产物仅写入 `/tmp`。
+- Workers 复核确认新路径继续通过 `env.DB` binding 访问 KV，所有 put/delete 均 await，无模块级请求状态或新增 secret 暴露。
+- 本轮未提交、未推送、未部署生产。

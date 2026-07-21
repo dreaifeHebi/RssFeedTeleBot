@@ -200,7 +200,7 @@ Complete — implementation, documentation, review, tests, and Worker dry-run fi
 |---|---|
 | 独立转发存入 D1，而非 KV 数组 | 支持每订阅多目标、精确删除和参数化授权，避免 KV 并发覆盖与枚举困难 |
 | 没有独立 settings 行时继承旧 KV | 保持升级前行为不变，无需迁移现有配置 |
-| 菜单使用短 session token + KV TTL | Callback data 保持短小，状态可绑定用户/chat/thread，适合分步输入 |
+| 菜单使用短 session token，权威会话与租约存入 D1 | Callback data 保持短小；D1 CAS/lease 可绑定用户、chat、thread 和当前键盘，并防止旧 Worker 覆盖；KV 仅保留 canonical panel 指针与清理元数据 |
 | 旧命令继续作为快捷方式 | 降低现有用户迁移成本 |
 
 ## Errors Encountered
@@ -252,3 +252,112 @@ Complete — implementation, documentation, review, tests, and Worker dry-run fi
 - git diff --check: passed.
 - Wrangler 4.111.0 dry-run: passed, 322.01 KiB / gzip 73.89 KiB.
 - Production migration/deploy, commit, push, and delivery replay were not performed.
+
+---
+
+# Interaction Improvement Plan: Single-message management panel (2026-07-20)
+
+## Goal
+
+将 Telegram 菜单和管理 Callback 改为优先编辑原消息，避免每次点击都新增消息；输入步骤只保留必要的临时提示，并在完成或取消后尽力清理。
+
+## Current Phase
+
+Complete — implementation, concurrency hardening, documentation, tests, review, and Worker dry-run finished; production is not deployed.
+
+## Phases
+
+- [x] S1：盘点所有菜单 Callback 的发送/编辑路径与测试夹具（complete）
+- [x] S2：设计统一的 edit-or-send 渲染 helper 和 Telegram 兼容降级（complete）
+- [x] S3：实现单消息导航、临时输入提示清理及会话绑定（complete）
+- [x] S4：补齐回归测试、全量校验与文档说明（complete）
+
+## Constraints
+
+- Callback 导航必须优先编辑触发按钮所在消息。
+- Telegram 返回 “message is not modified” 时视为幂等成功，不额外发送消息。
+- 原消息不可编辑时允许降级发送一条新面板，但后续继续复用该面板。
+- ForceReply 输入提示与用户输入不能完全消失；处理结束后应尽力删除，删除失败不得影响业务操作。
+- 旧命令与权限、chat/thread/user/session 绑定保持兼容。
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| 内置 apply_patch 与固定内容的提升权限 apply_patch 均被 bwrap loopback RTM_NEWADDR 阻断 | 1–2 | 沿用本仓库既有路径限定 git apply 方案；所有补丁携带固定内容并逐文件验证 |
+| 无补丁内容的交互式 apply_patch 被安全审查拒绝 | 1 | 不再尝试交互式写入 |
+| 首次三文件 git apply 因 findings.md 行号定位过期而原子拒绝 | 1 | 重新读取实际 EOF，改为逐文件 zero-context 追加 |
+| 首次 task_plan zero-context 补丁新增行计数错误 | 1 | 改用 --recount 由 Git 按固定内容重算 hunk |
+| 一次 git apply 补丁误带 apply_patch 结束标记 | 1 | Git 写入前拒绝；后续严格使用标准 unified diff |
+| S1 状态补丁首次使用过期行号 | 1 | rg 定位实际行 270 后用 zero-context 精确替换 |
+| telegram.js 首次业务补丁使用了缺少行号的 apply_patch 风格 hunk | 1 | Git 写入前拒绝；rg 定位后改为逐段 zero-context 固定补丁，语法检查通过 |
+| promptText 首次插入到 expiresAt 后未补逗号 | 1 | node --check 立即定位；调整字段顺序并复查通过 |
+| renderForwardCopyPanel 首次插入落在 sendForwardCopyPage 函数内部 | 1 | commands 测试暴露 ReferenceError；将外层闭合括号移到 helper 之前，恢复模块级作用域 |
+| 第一轮 commands 测试 17/21，修复作用域后 18/21 | 1–2 | 剩余三项均为预期文案/统一事件流断言；保留旧 callback 文案并更新面板事件断言后 21/21 通过 |
+| 双语 README 首次 zero-context 多文件补丁在英文插入点未匹配 | 1 | Git 原子拒绝无部分写入；改用实际相邻文本的逐文件标准 hunk 后成功 |
+| 清理空行与测试日志的多文件补丁在空白行 hunk 未匹配 | 1 | Git 原子拒绝无部分写入；测试与源码样式分别用实际上下文小补丁完成 |
+
+## Final Verification
+
+| Check | Result |
+|---|---|
+| `node --test test/commands.test.js` | 64/64 passed |
+| `npm test` | 162/162 passed |
+| `npm run check` | passed |
+| `git diff --check` | passed |
+| `npx wrangler deploy --dry-run` (Wrangler 4.111.0) | passed; 393.24 KiB / gzip 85.73 KiB |
+
+- Final read-only review found no remaining P1/P2 issue.
+- No commit, push, or production deployment was performed.
+
+---
+
+# Interaction Improvement Plan: Default forwarding menu (2026-07-20)
+
+## Goal
+
+在现有单消息 Telegram 面板中补齐聊天/Topic 默认 Forward 的查看、设置与删除入口，并继续区分“默认转发”和“分别管理每条订阅”。
+
+## Current Phase
+
+Complete — default-forwarding menu, focused coverage, documentation, full validation, Workers review, and dry-run all passed.
+
+## Phases
+
+- [x] D1：核对命令、KV、Poller 优先级和现有菜单缺口（complete）
+- [x] D2：实现转发入口页、默认规则页面、输入设置与删除确认（complete）
+- [x] D3：补齐并发/回放/权限/单消息测试及双语文档（complete）
+- [x] D4：运行全量检查、Workers review 与 Wrangler dry-run（complete）
+
+## Constraints
+
+- /set_forward、/del_forward 继续兼容，Poller 路由语义不变。
+- Topic 页面可分别管理当前 Topic 与 Global；非 Topic 页面管理 Global。
+- 设置目标必须重新校验目标聊天管理权限。
+- 已有独立订阅规则不受默认规则修改影响。
+- Callback、确认 nonce、输入 session 与 panel lease 继续 fail closed。
+- 主导航、设置结果与删除结果只编辑 canonical panel；仅文本输入使用临时 ForceReply。
+- 继续通过 env.DB KV binding 访问默认配置，不从 Worker 内调用 Cloudflare REST API。
+- 不提交、不推送、不部署生产。
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| 首次规划补丁的 JavaScript template literal 含 Markdown backtick | 1 | 工具在写入前报 SyntaxError；移除补丁中的 Markdown backtick 后重试 |
+| 首次 callback 多 hunk 补丁的新增行计数不准确 | 1 | Git 在写入前报 damaged patch；改用 --recount 自动重算固定补丁 |
+| 首次默认转发 commands 回归有 4 个失败 | 1 | 3 个旧测试进入新 hub 的点击顺序反了，4 个新增测试被插入上一测试内部；调整导航顺序并恢复顶层测试 |
+| 新输入租约测试的 session ID 超过生产 24 字符上限 | 1 | 回调在进入租约前按协议拒绝；缩短 fixture session ID 并保留断言标签 |
+| 内置 apply_patch 与普通只读命令受 bwrap uid/network namespace 故障影响 | 多次 | 使用获准的沙箱外只读命令及路径限定 git apply；未绕过仓库范围 |
+
+## Final Validation
+
+| Check | Result |
+|---|---|
+| `node --test test/commands.test.js` | 69/69 passed |
+| `npm test` | 167/167 passed |
+| `npm run check` | passed |
+| `git diff --check` | passed |
+| `npx wrangler deploy --dry-run --outdir /tmp/rss-feed-bot-default-forward` | passed; 406.54 KiB / gzip 87.91 KiB |
+
+- Workers review found no new binding, await, global-state, or secret-handling issue. No commit, push, or production deployment was performed.

@@ -173,14 +173,26 @@ Send `/menu` to open the main menu. It lets you:
 
 - choose RSS, X, or YouTube and reply with the URL/username;
 - page through subscriptions in the current chat/topic and confirm deletions;
+- inspect, set, or delete the current topic/global default route under **Message Forwarding**, choosing source-plus-target or target-only delivery;
 - manage forwarding targets, source delivery, and default-route inheritance per subscription, including an explicit source-only override;
 - enter a target chat/topic and choose subscriptions to copy from a paginated list;
 - view the current Chat ID, Topic ID, and help.
 
-Input sessions expire after 10 minutes and menus after one hour. Both are bound
-to the initiating user, chat, and topic. In groups, reply directly to the bot's
-input prompt. Use `/cancel` to cancel the current input. RSS labels continue to
-show only the hostname, never URL paths, query values, or credentials.
+Menu navigation, paging, confirmations, and results edit one canonical bot
+message instead of posting a new message for every tap. A later `/menu` also
+reuses that panel when Telegram still allows it to be edited. Text entry creates
+one temporary ForceReply prompt so Telegram can focus the input; after success
+or cancel, the bot best-effort removes that prompt and the submitted input. A
+message can remain when Telegram does not grant the bot deletion permission.
+
+Input sessions expire after 10 minutes and menus normally expire after one hour;
+an active input extends its parent menu through the full reply window. Both are
+bound to the initiating user, chat, and topic. In groups, reply directly to the
+bot's input prompt. Use `/cancel` to cancel the current input. RSS labels
+continue to show only the hostname, never URL paths, query values, or
+credentials. Expired input cleanup metadata is retained for up to 47 hours so a
+later interaction can still remove its temporary prompt within Telegram's
+deletion window.
 
 The commands below remain available as shortcuts.
 
@@ -218,7 +230,13 @@ The commands below remain available as shortcuts.
     *Output format:* `#<subscription_id> [type] safe_name` (for example, `#42 [rss] example.com`). RSS safe names contain only the hostname; URL paths and embedded credentials are never displayed.
 
 *   **Default Chat/Topic Message Forwarding**:
-    Configure the default route for subscriptions in the current chat/topic.
+    Open `/menu`, choose **Message Forwarding**, then **Default Forwarding** to
+    inspect the effective route, independently set or delete the current Topic and
+    Global rules, and choose source-plus-target or target-only delivery. A
+    non-topic chat shows only Global. Global covers all topics in the source chat,
+    while a current-topic rule takes precedence.
+
+    The commands below are shortcuts for the same configuration:
     ```text
     /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]
     ```
@@ -243,7 +261,8 @@ The commands below remain available as shortcuts.
     subscription's menu before it follows the default again.
 
 *   **Per-subscription message forwarding (menu)**:
-    Open `/menu`, choose **Message Forwarding**, then choose a subscription.
+    Open `/menu`, choose **Message Forwarding**, then **Manage Each Subscription**,
+    and choose a subscription.
     Each subscription can have up to 10 independently removable target
     chats/topics, can keep or suppress its source delivery, and can return to
     the current topic/global default rule. **Source only (stop inheriting)**
@@ -287,8 +306,8 @@ The commands below remain available as shortcuts.
 
 ### Storage ownership
 
-- **D1 (`SQL`)** owns `subscriptions`, `subscription_routing_settings`, `subscription_forward_targets`, `processed_updates`, `operational_leases`, and `deliveries`. Per-subscription rules and targets are linked to stable subscription IDs. Each item/final-target pair has its own outbox row, so partial Telegram failures can be retried independently.
-- **KV (`DB`)** stores bounded per-feed seen history, legacy chat/topic default forwarding configuration, short-lived menu/input/copy sessions, and the polling cursor.
+- **D1 (`SQL`)** owns `subscriptions`, `subscription_routing_settings`, `subscription_forward_targets`, `processed_updates`, `operational_leases`, and `deliveries`. `operational_leases` also holds expiring menu/input/copy state, panel locks, and forward CAS claims so callbacks see authoritative state across locations. Per-subscription rules and targets are linked to stable subscription IDs. Each item/final-target pair has its own outbox row, so partial Telegram failures can be retried independently.
+- **KV (`DB`)** stores bounded per-feed seen history, legacy chat/topic default forwarding configuration, retained input-cleanup metadata, the canonical menu message pointer, and the polling cursor.
 - A legacy KV `subscriptions` array is copied into D1 automatically on the first invocation after migrations are applied. The import and migration marker are committed together, and the old KV value is intentionally retained for rollback/audit; remove it manually only after verifying D1.
 - Delivery is at-least-once: if the Worker crashes after Telegram accepts a message but before D1 records it as sent, a later retry can deliver that message again.
 

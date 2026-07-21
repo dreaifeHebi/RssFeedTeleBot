@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   answerCallbackQuery,
   buildTelegramFailureLogDetails,
+  deleteTelegramMessage,
+  editTelegramMessage,
   escapeHtml,
   getChatMember,
   isChatAdministrator,
@@ -484,4 +486,103 @@ test('Telegram log sanitization redacts before truncation and allowlists fields'
     JSON.stringify(details),
     /boundary-secret|unique-private-payload|api\.telegram\.org\/bot/
   );
+});
+
+test('editTelegramMessage and deleteTelegramMessage use bounded message IDs', async () => {
+  const requests = [];
+  const fetchFn = async (url, init) => {
+    requests.push({ url, payload: JSON.parse(init.body) });
+    return new Response(JSON.stringify({
+      ok: true,
+      result: url.endsWith('/deleteMessage')
+        ? true
+        : { message_id: 77 }
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    });
+  };
+
+  const edited = await editTelegramMessage(
+    'token',
+    '-100',
+    '77',
+    '<b>Updated</b>',
+    { inline_keyboard: [[{ text: 'Back', callback_data: 'back' }]] },
+    { fetchFn }
+  );
+  const deleted = await deleteTelegramMessage(
+    'token',
+    '-100',
+    78,
+    { fetchFn }
+  );
+
+  assert.equal(edited.ok, true);
+  assert.equal(deleted.ok, true);
+  assert.deepEqual(requests, [
+    {
+      url: 'https://api.telegram.org/bottoken/editMessageText',
+      payload: {
+        chat_id: '-100',
+        message_id: 77,
+        text: '<b>Updated</b>',
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[{ text: 'Back', callback_data: 'back' }]]
+        }
+      }
+    },
+    {
+      url: 'https://api.telegram.org/bottoken/deleteMessage',
+      payload: {
+        chat_id: '-100',
+        message_id: 78
+      }
+    }
+  ]);
+
+  let called = false;
+  const invalid = await editTelegramMessage(
+    'token',
+    '-100',
+    '9007199254740992',
+    'text',
+    null,
+    {
+      fetchFn: async () => {
+        called = true;
+        return new Response('{}');
+      }
+    }
+  );
+  assert.equal(called, false);
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.error, /message_id/);
+});
+
+test('edit failures expose only a sanitized API description for control flow', async () => {
+  const token = 'edit-token-secret';
+  const text = 'private-edit-payload';
+  const result = await editTelegramMessage(
+    token,
+    123,
+    77,
+    text,
+    null,
+    {
+      fetchFn: async () => new Response(JSON.stringify({
+        ok: false,
+        description: 'Bad Request: message is not modified ' + text + ' ' + token
+      }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'Telegram HTTP 400');
+  assert.match(result.apiDescription, /message is not modified/);
+  assert.doesNotMatch(JSON.stringify(result), /private-edit-payload|edit-token-secret/);
 });

@@ -170,13 +170,21 @@ Telegram 会把该值放入 `X-Telegram-Bot-Api-Secret-Token` 请求头；请求
 
 - 选择 RSS、X 或 YouTube 后，直接回复 URL/用户名来添加订阅；
 - 分页查看当前聊天或 Topic 的订阅，进入详情后确认删除；
+- 在“消息转发”中查看、设置或删除当前 Topic/Global 默认规则，并选择“源会话 + 目标”或“仅目标”；
 - 为每条订阅分别管理转发目标、源会话投递与默认规则继承，也可停止继承并改为仅源会话；
 - 输入目标 Chat/Topic 后，从分页列表选择要复制的订阅；
 - 查看当前 Chat ID、Topic ID 和帮助。
 
-输入会话默认 10 分钟失效，菜单默认 1 小时失效，并绑定发起用户、聊天和
-Topic。在群聊中应直接回复机器人的输入提示；发送 `/cancel` 可取消当前输入。
-RSS 名称仍只显示 hostname，不显示 URL path、query 或凭据。
+菜单导航、分页、确认和操作结果都会编辑同一条机器人面板消息，不再每点一次就新增
+一条消息；以后重新发送 `/menu` 时，只要 Telegram 仍允许编辑，也会继续复用这条面板。
+需要文本输入时只会临时创建一条 ForceReply 提示；成功或取消后，机器人会尽力删除这条
+提示和已提交的输入。如果 Telegram 未授予机器人删除权限，相关消息可能保留。
+
+输入会话默认 10 分钟失效，菜单通常在 1 小时后失效；输入进行期间，父菜单会延长到
+覆盖完整的回复窗口。两者都绑定发起用户、聊天和 Topic。在群聊中应直接回复机器人的
+输入提示；发送 `/cancel` 可取消当前输入。RSS 名称仍只显示 hostname，不显示 URL
+path、query 或凭据。过期输入的清理元数据会最多保留 47 小时，让后续交互仍可在
+Telegram 的删除时限内清理临时提示。
 
 下面的命令继续作为快捷方式保留。
 
@@ -214,7 +222,11 @@ RSS 名称仍只显示 hostname，不显示 URL path、query 或凭据。
     *输出格式:* `#<subscription_id> [type] safe_name`（例如 `#42 [rss] example.com`）。RSS 的安全名称仅包含 hostname，不会展示 URL path 或内嵌凭据。
 
 *   **聊天/Topic 默认消息转发**:
-    为当前聊天或 Topic 的订阅配置默认消息路由。
+    在 `/menu` 中依次选择“消息转发”→“默认转发”，可以查看当前有效规则，分别设置或
+    删除当前 Topic 与 Global 规则，并选择“源会话 + 目标”或“仅目标”。非 Topic 会话
+    只显示 Global；Global 会覆盖当前聊天的所有 Topics，但当前 Topic 的规则优先。
+
+    下面的命令是同一功能的快捷方式：
     ```text
     /set_forward <target_chat_id> [target_thread_id] [only_forward] [scope]
     ```
@@ -238,7 +250,7 @@ RSS 名称仍只显示 hostname，不显示 URL path、query 或凭据。
     `/del_forward` 影响；在该订阅的转发页面选择“恢复继承聊天规则”后才会重新跟随默认规则。
 
 *   **每条订阅独立消息转发（菜单）**:
-    在 `/menu` 中依次选择“消息转发”与具体订阅。每条订阅可以：
+    在 `/menu` 中依次选择“消息转发”→“分别管理每条订阅”→具体订阅。每条订阅可以：
 
     - 保存最多 10 个目标 Chat/Topic，并单独删除；
     - 选择“源会话 + 目标”或“仅目标”；
@@ -279,8 +291,8 @@ RSS 名称仍只显示 hostname，不显示 URL path、query 或凭据。
 
 ### 存储职责
 
-- **D1 (`SQL`)** 保存 `subscriptions`、`subscription_routing_settings`、`subscription_forward_targets`、`processed_updates`、`operational_leases` 和 `deliveries`。每订阅独立规则和目标使用稳定订阅 ID 关联；每个条目/最终目标组合都有独立 Outbox 记录，可按目标单独重试。
-- **KV (`DB`)** 保存有界的 Feed 已见历史、旧的 chat/topic 默认转发配置、短期菜单/输入/复制 Session 和轮询游标。
+- **D1 (`SQL`)** 保存 `subscriptions`、`subscription_routing_settings`、`subscription_forward_targets`、`processed_updates`、`operational_leases` 和 `deliveries`。`operational_leases` 还保存带过期时间的菜单/输入/复制状态、面板锁与 forward CAS claim，保证不同位置的 Callback 都读取权威状态。每订阅独立规则和目标使用稳定订阅 ID 关联；每个条目/最终目标组合都有独立 Outbox 记录，可按目标单独重试。
+- **KV (`DB`)** 保存有界的 Feed 已见历史、旧的 chat/topic 默认转发配置、延长保留的输入清理元数据、固定菜单消息指针和轮询游标。
 - 应用 D1 迁移后，首次运行会自动把旧 KV `subscriptions` 数组复制到 D1。导入与迁移标记会一起提交，旧 KV 值会有意保留用于回滚/审计；确认 D1 数据正确后再手动删除。
 - 投递语义为 at-least-once：若 Telegram 已接受消息、但 Worker 在 D1 标记 sent 前崩溃，后续重试可能再次投递同一消息。
 

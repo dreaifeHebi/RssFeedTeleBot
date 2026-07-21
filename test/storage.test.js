@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   acquireOperationalLease,
+  applyOperationalStateChanges,
   addSubscriptionForwardTarget,
   addSubscription,
   claimUpdate,
@@ -19,6 +20,8 @@ import {
   markDeliveryRetry,
   markDeliverySent,
   pruneOperationalState,
+  readOperationalState,
+  renewOperationalLease,
   releaseOperationalLease,
   releaseUpdate,
   removeSubscriptionForwardTarget,
@@ -64,6 +67,7 @@ class FakeD1 {
     this.allCalls = [];
     this.runCalls = [];
     this.batchCalls = [];
+    this.sessionConstraints = [];
   }
 
   prepare(sql) {
@@ -76,6 +80,11 @@ class FakeD1 {
       this.batchResults,
       statements.map(() => changed(1))
     );
+  }
+
+  withSession(constraint) {
+    this.sessionConstraints.push(constraint);
+    return this;
   }
 }
 
@@ -331,28 +340,72 @@ test('legacy migration errors never write the completion marker', async () => {
   assert.equal(SQL.batchCalls.length, 0);
 });
 
-test('copySubscriptions deduplicates the batch for one normalized target', async () => {
-  const SQL = new FakeD1({ batch: [[changed(1)]] });
-  const duplicate = {
-    type: 'rss',
-    channelName: 'Feed',
-    rssUrl: 'https://example.com/feed.xml',
+test('copySubscriptions performs one set-based insert and keeps first normalized duplicate', async () => {
+  const SQL = new FakeD1({ run: [changed(2)] });
+  const first = {
+    type: 'RSS',
+    channelName: 'Ignored RSS title',
+    rssUrl: ' https://example.com/feed.xml ',
     chatId: 'ignored',
     threadId: 99
   };
+  const duplicate = {
+    ...first,
+    type: 'x',
+    channelName: 'Must not replace the first row',
+    rssUrl: 'https://example.com/feed.xml'
+  };
+  const second = {
+    type: 'youtube',
+    channelName: ' Video Channel ',
+    rssUrl: 'https://example.com/video.xml',
+    chatId: 'also ignored',
+    threadId: 100
+  };
 
   assert.equal(
-    await copySubscriptions({ SQL }, [duplicate, duplicate], -200, null),
-    1
+    await copySubscriptions(
+      { SQL },
+      [first, duplicate, second],
+      -200,
+      null
+    ),
+    2
   );
-  assert.equal(SQL.batchCalls[0].length, 1);
-  assert.deepEqual(SQL.batchCalls[0][0].params, [
-    'rss',
-    'example.com',
-    'https://example.com/feed.xml',
-    '-200',
-    ''
+
+  assert.equal(SQL.runCalls.length, 1);
+  assert.equal(SQL.batchCalls.length, 0);
+  const [call] = SQL.runCalls;
+  assert.match(call.sql, /FROM json_each\(\?\)/);
+  assert.match(
+    call.sql,
+    /ON CONFLICT\(rss_url, chat_id, thread_id\) DO NOTHING/
+  );
+  assert.equal(call.params.length, 1);
+  assert.deepEqual(JSON.parse(call.params[0]), [
+    {
+      type: 'rss',
+      channelName: 'example.com',
+      rssUrl: 'https://example.com/feed.xml',
+      chatId: '-200',
+      threadId: ''
+    },
+    {
+      type: 'youtube',
+      channelName: 'Video Channel',
+      rssUrl: 'https://example.com/video.xml',
+      chatId: '-200',
+      threadId: ''
+    }
   ]);
+});
+
+test('copySubscriptions avoids D1 writes for an empty source list', async () => {
+  const SQL = new FakeD1();
+
+  assert.equal(await copySubscriptions({ SQL }, [], -200, null), 0);
+  assert.equal(SQL.runCalls.length, 0);
+  assert.equal(SQL.batchCalls.length, 0);
 });
 
 test('update leases can be claimed, completed, released, and reclaimed only after expiry', async () => {
@@ -432,9 +485,9 @@ test('getUpdateState distinguishes completed, processing, and missing updates', 
   assert.match(SQL.firstCalls[0].sql, /FROM processed_updates/);
 });
 
-test('operational leases are acquired atomically and released only by their owner', async () => {
+test('operational leases are acquired, renewed, and released only by their owner', async () => {
   const SQL = new FakeD1({
-    run: [changed(1), changed(0), changed(1)]
+    run: [changed(1), changed(0), changed(1), changed(0), changed(1)]
   });
 
   assert.equal(
@@ -454,6 +507,22 @@ test('operational leases are acquired atomically and released only by their owne
     false
   );
   assert.equal(
+    await renewOperationalLease(
+      { SQL },
+      'rss-poller',
+      { leaseToken: 'run-a', leaseSeconds: 600 }
+    ),
+    true
+  );
+  assert.equal(
+    await renewOperationalLease(
+      { SQL },
+      'rss-poller',
+      { leaseToken: 'run-b', leaseSeconds: 600 }
+    ),
+    false
+  );
+  assert.equal(
     await releaseOperationalLease(
       { SQL },
       'rss-poller',
@@ -465,8 +534,11 @@ test('operational leases are acquired atomically and released only by their owne
   assert.deepEqual(SQL.runCalls[0].params, ['rss-poller', 'run-a', 1200]);
   assert.match(SQL.runCalls[0].sql, /ON CONFLICT\(name\) DO UPDATE/);
   assert.match(SQL.runCalls[0].sql, /lease_expires_at <= unixepoch\(\)/);
-  assert.deepEqual(SQL.runCalls[2].params, ['rss-poller', 'run-a']);
-  assert.match(SQL.runCalls[2].sql, /DELETE FROM operational_leases/);
+  assert.deepEqual(SQL.runCalls[2].params, [600, 'rss-poller', 'run-a']);
+  assert.match(SQL.runCalls[2].sql, /lease_expires_at > unixepoch\(\)/);
+  assert.deepEqual(SQL.runCalls[3].params, [600, 'rss-poller', 'run-b']);
+  assert.deepEqual(SQL.runCalls[4].params, ['rss-poller', 'run-a']);
+  assert.match(SQL.runCalls[4].sql, /DELETE FROM operational_leases/);
 
   await assert.rejects(
     acquireOperationalLease(
@@ -478,9 +550,70 @@ test('operational leases are acquired atomically and released only by their owne
   );
 });
 
+test('operational state uses a primary read and atomic CAS mutations', async () => {
+  const SQL = new FakeD1({
+    first: [{ value: '{"phase":"open"}' }],
+    batch: [[changed(1), changed(1), changed(1)]]
+  });
+
+  assert.equal(
+    await readOperationalState({ SQL }, 'fwd_session:test'),
+    '{"phase":"open"}'
+  );
+  assert.deepEqual(SQL.sessionConstraints, ['first-primary']);
+  assert.match(SQL.firstCalls[0].sql, /lease_expires_at > unixepoch\(\)/);
+  assert.deepEqual(SQL.firstCalls[0].params, ['fwd_session:test']);
+
+  assert.equal(
+    await applyOperationalStateChanges({ SQL }, [
+      {
+        name: 'ui_session:new',
+        value: '{"v":1}',
+        expirationTtl: 3600
+      },
+      {
+        name: 'ui_active:scope',
+        value: 'new',
+        expectedValue: 'old',
+        expirationTtl: 3600
+      },
+      {
+        name: 'ui_input:scope',
+        delete: true,
+        expectedValue: '{"v":1}'
+      }
+    ]),
+    3
+  );
+  const [put, replace, remove] = SQL.batchCalls[0];
+  assert.deepEqual(put.params, ['ui_session:new', '{"v":1}', 3600]);
+  assert.match(put.sql, /ON CONFLICT\(name\) DO UPDATE/);
+  assert.deepEqual(
+    replace.params,
+    ['new', 3600, 'ui_active:scope', 'old']
+  );
+  assert.match(
+    replace.sql,
+    /lease_token = \?.*lease_expires_at > unixepoch\(\)/s
+  );
+  assert.deepEqual(
+    remove.params,
+    ['ui_input:scope', '{"v":1}']
+  );
+
+  await assert.rejects(
+    applyOperationalStateChanges({ SQL }, [{
+      name: 'invalid',
+      value: 'x',
+      expirationTtl: 59
+    }]),
+    /expirationTtl/
+  );
+});
+
 test('pruneOperationalState deletes only old terminal records', async () => {
   const SQL = new FakeD1({
-    batch: [[changed(2), changed(3), changed(4)]]
+    batch: [[changed(2), changed(3), changed(4), changed(5)]]
   });
 
   assert.deepEqual(
@@ -496,14 +629,15 @@ test('pruneOperationalState deletes only old terminal records', async () => {
       processedUpdates: 2,
       sentDeliveries: 3,
       deadDeliveries: 4,
-      total: 9
+      operationalLeases: 5,
+      total: 14
     }
   );
 
   assert.equal(SQL.batchCalls.length, 1);
   assert.deepEqual(
     SQL.batchCalls[0].map((statement) => statement.params),
-    [[604800, 604800], [691200], [2592000]]
+    [[604800, 604800], [691200], [2592000], []]
   );
   assert.match(
     compactSql(SQL.batchCalls[0][0].sql),
@@ -516,6 +650,10 @@ test('pruneOperationalState deletes only old terminal records', async () => {
   assert.match(
     compactSql(SQL.batchCalls[0][2].sql),
     /status = 'dead'.*updated_at/
+  );
+  assert.match(
+    compactSql(SQL.batchCalls[0][3].sql),
+    /operational_leases.*lease_expires_at <= unixepoch\(\)/
   );
 
   await assert.rejects(

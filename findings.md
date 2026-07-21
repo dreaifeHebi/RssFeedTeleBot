@@ -19,12 +19,12 @@ RssFeedTeleBot 已从单文件、KV 数组状态重构为单 Worker 的模块化
 
 ### State ownership
 
-- D1 表共 5 张：app_meta、subscriptions、processed_updates、operational_leases、deliveries。
+- D1 表共 7 张：app_meta、subscriptions、subscription_routing_settings、subscription_forward_targets、processed_updates、operational_leases、deliveries。
 - subscriptions 使用唯一约束消除并发 /add 覆盖和重复。
 - processed_updates 通过 processing/completed 状态及 lease 区分完成重复、正在处理和失败重试。
-- operational_leases 防止重叠 Cron 同时消费 Outbox；运行结束不遗留租约行。
+- operational_leases 同时承载 Cron/面板互斥租约与带过期时间的交互状态；Callback 使用 primary read 与 CAS fencing。
 - deliveries 按 feed/item/target 唯一，独立保存 pending、sent、dead、attempts 和 next_attempt_at。
-- KV 仅保存 forwarding config、短期 callback/session、已见 aliases 和 poll cursor。
+- KV 保存 forwarding config、已见 aliases、poll cursor、固定面板指针和可重试的临时消息清理元数据。
 
 ## Security Findings Resolved
 
@@ -335,3 +335,62 @@ RssFeedTeleBot 已从单文件、KV 数组状态重构为单 Worker 的模块化
 - node:sqlite 从 Node 22.13 起无需 experimental flag；项目 root engine 应从 >=22 收紧到 >=22.13.0，并同步 package-lock root。
 - 复审后的两个 P2 均已修复：初始化路径原子封顶 10 个目标，Node engine 与 node:sqlite 下限一致。
 - 最后一次只读复审未发现剩余 P1/P2。
+
+## Single-message management panel (2026-07-20)
+
+- 用户确认现有 UI 结构可接受，新的核心诉求是 Callback 导航不再逐次堆叠 Telegram 消息。
+- 初步搜索显示 commands.js 目前集中通过既有 sendMessage 服务渲染菜单，尚未接入 editMessageText/deleteMessage 服务。
+- ForceReply 是必要的输入例外；目标体验是输入期间临时出现提示，成功/取消后 best-effort 清理提示和用户回复。
+- UI Callback 会把 callbackQuery.message 复制到 context，但当前没有保存 callbackQuery.id 或“这是按钮导航”的显式标志；可在 context 中加入 panelMessageId/callbackQuery，再由统一 renderer 判断 edit。
+- 所有 ui:* 页面最终都走 send(context, text, keyboard)，因此增加 renderUiPanel/edit-or-send helper 可以集中替换；普通命令消息仍继续使用 send。
+- 旧 fwd:* 复制订阅翻页也会 sendForwardCopyPage → send，属于同一堆叠问题，需要让该分页同样编辑触发消息。
+- telegram.js 当前只有 sendMessage、answerCallbackQuery、getChatMember；需增加 editMessageText 和 deleteMessage 的结构化包装，并沿用统一诊断、脱敏与超时处理。
+- 菜单 session 已绑定 chat/thread/user；单消息复用应再绑定 panel message_id，避免同一 session 的 Callback 被复制到其他消息后编辑错误面板。
+- 严格单 Bot 消息与 ForceReply 自动弹出输入框无法同时成立：Telegram editMessageText 只接受 InlineKeyboardMarkup。折中为主面板始终编辑复用、输入时只创建一条临时 ForceReply，结束/取消后 best-effort 删除。
+- 状态修改应把成功/警告作为 notice 合并进最终页面，避免当前“结果消息 + 详情页面”双发送。
+- 文本输入失败不应再发错误消息；应编辑主面板显示错误并保留同一临时 ForceReply。成功后清理 prompt 和用户输入，再编辑主面板显示结果。
+- Telegram HTTP 错误仍保持日志中的通用状态，但可在调用结果内保存已按 token/payload 脱敏的 API description，用于识别 message is not modified 与确定性编辑失败。
+- 最终实现结构：UI session 保存 panelMessageId + renderFingerprint；renderUiPanel 优先 edit，只有明确的 message missing/cannot edit 才重建；旧 fwd session 保存 selectorMessageId 并复用同一 selector。
+- commands 测试夹具可保留 messages 作为统一渲染事件流，同时单独记录 sends/edits/deletes；send message_id 必须用独立 sendCount，避免 edit 事件改变 ForceReply ID。
+- handleAdd 需要新增 silent/UI 结果模式，确保命令调用仍发送原文案，而菜单输入只返回结构化状态，由主面板一次性渲染。
+- renderUiPanel 已将可重试编辑失败与确定性“消息不存在/不可编辑”区分：前者不发送新消息，后者才重建面板并更新 session message_id。
+- 新测试证明：普通菜单导航及重复 /menu 保持 1 次 send；输入过程仅多 1 条临时 ForceReply，错误不新增，成功后删除 prompt 与用户输入；fwd 翻页/完成均为 edit。
+- 编辑失败降级测试覆盖确定性 missing → 单次重建，以及 503/retryable → 不 fallback，避免不确定结果造成重复面板。
+- Telegram 官方文档确认 Updating messages 专门用于减少 inline keyboard 会话杂乱；editMessageText 支持 chat_id/message_id、HTML text 与 InlineKeyboardMarkup，符合主面板设计。
+- deleteMessage 对普通消息有 48 小时限制；Bot 可删私聊入站消息，群/超群入站消息需要管理员/删除权限，因此清理必须保持 best-effort，不可影响业务结果。
+- 两次清理请求改为并行，并使用 2.5 秒短超时，避免 Telegram 删除权限或网络问题长时间阻塞主面板结果。
+- UI、输入与复制 Session 已从 eventually-consistent KV 迁入 D1；所有授权/fencing 读取使用 `withSession('first-primary')`。
+- 同一 chat/topic/user 面板通过 D1 lease 串行编辑；新 `/menu` 只有在 Telegram 渲染成功后保留，明确失败会以 CAS 恢复旧 active session。
+- forward session 以 `open → processing → complete/stale/revoked` 状态机运行；claim 过期可接管，但旧 worker 的 completion CAS 会失败且不得再编辑面板。
+- selector 在 Telegram 渲染前已写入 D1，避免用户快速点击时被误判为过期；完成态保留到 Session TTL，重放不会再次复制。
+- ForceReply 发送失败会恢复主页；状态持久化失败会尽力删除 prompt、恢复主页并保留原错误。
+- `copySubscriptions` 已从每订阅一条 D1 statement 改为单条参数化 `INSERT … SELECT FROM json_each(?)`，复制数量不再线性消耗单次 Worker 的 D1 查询预算。
+- 输入清理 retry metadata 仍在 KV，并将同 key 变更合并为单次 mutation，以遵守 KV 同 key 写入频率限制。
+- 真实 SQLite 回归覆盖两个 CAS 竞争者、lease owner release；commands 回归覆盖终态重放、claim 过期接管、并发翻页/完成、新菜单 fencing 与重复 `/menu` 503 回滚。
+- 权威 UI/input/forward session 与 panel lease 已迁入 D1；KV 只保留 canonical panel 指针和输入清理元数据。D1 owner lease、exact CAS 与最终 batch guard 可阻止失去租约的旧 Worker 覆盖新页面或提交旧结果。
+- 普通 UI 与 forward selector 都保存当前键盘 callback allowlist；破坏性确认和输入取消额外使用一次性 nonce，旧分页、旧确认页、旧输入页及取消后的回放会 fail closed。
+- 输入提示发送、claim 与续租都会把父 UI session/active pointer 延长到最终 input expiry；ForceReply 后还会按新 cancel nonce 续租并重验当前 view，接管时只清理旧 Worker 自己的提示。
+- 确定性并发测试覆盖 A 初始化阻塞、lease/claim 过期、B 接管、A 恢复，以及输入入口、429/503、stale render、nonce replay 和 cancel CAS=0。
+- 最终只读复审未发现剩余 P1/P2；超过 60 秒异常暂停仍属于理论 P3 窗口，结合 Telegram 10 秒超时不阻断本次交付。
+- 最终验证：commands 64/64、全套 162/162、`npm run check` 与 `git diff --check` 均通过；Wrangler 4.111.0 dry-run 通过（393.24 KiB / gzip 85.73 KiB）。未提交、推送或部署生产。
+
+## Default forwarding menu (2026-07-20)
+
+- 用户确认菜单缺少“主/默认 Forward”配置路径，并要求追加。
+- 后端能力已经存在：/set_forward 与 /del_forward 直接维护 KV forward_config:<chat>[:<thread>]；Poller 优先使用独立 D1 routing，再按 Topic → Global → source 解析默认规则。
+- 当前主菜单“消息转发”直接进入 fl:0 的逐订阅列表；缺少默认规则的查看、设置和删除 Callback。
+- 目标 UX：消息转发 → 默认转发 / 分别管理，默认页同时展示当前有效规则和各作用域的原始配置。
+- Topic 中提供“当前 Topic”和“Global（所有 Topics）”；非 Topic 中只提供 Global，避免同一 KV key 上两种 chat-default 语义互相覆盖。
+- 设置流程先选择“源会话 + 目标”或“仅目标”，再通过临时 ForceReply 输入 <Chat ID> [Topic ID]。
+- 删除使用带 8 字符 nonce 的确认页，并在 KV delete 前重新续租、重验当前 callback view。
+- 输入完成沿用现有 claim/CAS 状态机；目标授权失败时重开同一输入，不新增结果消息。
+- 独立订阅规则不因默认规则改变而重写；默认页需明确这一点。
+- 最新 Cloudflare Workers 最佳实践仍建议使用 bindings 访问 Cloudflare 服务、await 所有 Promise，并用 Web Crypto 生成安全 token；现有架构与新增路径将继续遵守这些约束。
+- 最新 @cloudflare/workers-types 为 5.20260719.1，KVNamespace 的 put/delete 仍返回 Promise，新增路径必须完整 await。
+- 不需要 D1 migration；默认规则继续保存在现有 KV binding。
+- 默认转发菜单写入沿用旧命令的 KV schema：Global 保存 isGlobal=true，Topic 保存 isGlobal=false，因此 Poller 无需修改。
+- 确认删除除了当前键盘 allowlist 的一次性 nonce，还绑定当前规范化配置的短版本；面板打开后若规则被外部命令修改，旧确认不会删除新配置。
+- 新路径在目标授权失败时恢复 input phase=open 并编辑原面板，不写 KV、不增加结果消息。
+- 聚焦回归为 69/69；覆盖 Callback 64-byte 上限、单 canonical panel、临时 ForceReply、作用域展示、权限、租约与回放 fencing。
+- 本地 Wrangler 4.111.0 与配置 schema 可用，compatibility_date 为 2026-07-17；官方命令文档确认 `deploy --dry-run` 只编译而不部署。
+- 全量 167/167 和 406.54 KiB / gzip 87.91 KiB dry-run 均通过；Workers 复核未发现新增 P1/P2。

@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { initializeSubscriptionRouting } from '../src/storage.js';
+import {
+  acquireOperationalLease,
+  applyOperationalStateChanges,
+  initializeSubscriptionRouting,
+  readOperationalState,
+  releaseOperationalLease
+} from '../src/storage.js';
 
 const INITIAL_MIGRATION = readFileSync(
   new URL('../migrations/0001_initial.sql', import.meta.url),
@@ -14,13 +20,30 @@ const FORWARDING_MIGRATION = readFileSync(
 );
 
 function createSqliteD1(database) {
-  return {
-    prepare(sql) {
+  const prepare = (sql, params = []) => ({
+    sql,
+    params,
+    bind(...nextParams) {
+      return prepare(sql, nextParams);
+    },
+    async first() {
+      return database.prepare(sql).get(...params) ?? null;
+    },
+    async all() {
+      return { results: database.prepare(sql).all(...params) };
+    },
+    async run() {
+      const result = database.prepare(sql).run(...params);
       return {
-        bind(...params) {
-          return { sql, params };
+        meta: {
+          changes: Number(result.changes)
         }
       };
+    }
+  });
+  const binding = {
+    prepare(sql) {
+      return prepare(sql);
     },
     async batch(statements) {
       database.exec('BEGIN IMMEDIATE');
@@ -41,8 +64,12 @@ function createSqliteD1(database) {
         database.exec('ROLLBACK');
         throw error;
       }
+    },
+    withSession() {
+      return binding;
     }
   };
+  return binding;
 }
 
 test('subscription forwarding migrations enforce target uniqueness and cleanup', () => {
@@ -200,3 +227,89 @@ test('routing initialization keeps the target cap across repeated snapshots', as
   }
 });
 
+test('interaction CAS and panel leases serialize on real SQLite', async () => {
+  const database = new DatabaseSync(':memory:');
+
+  try {
+    database.exec(INITIAL_MIGRATION);
+    const SQL = createSqliteD1(database);
+    const env = { SQL };
+    const open = JSON.stringify({ phase: 'open', revision: 'one' });
+    const claimedA = JSON.stringify({
+      phase: 'processing',
+      revision: 'two',
+      claimToken: 'a'
+    });
+    const claimedB = JSON.stringify({
+      phase: 'processing',
+      revision: 'three',
+      claimToken: 'b'
+    });
+
+    assert.equal(
+      await applyOperationalStateChanges(env, [{
+        name: 'fwd_session:sqlite',
+        value: open,
+        expirationTtl: 3600
+      }]),
+      1
+    );
+    assert.equal(
+      await applyOperationalStateChanges(env, [{
+        name: 'fwd_session:sqlite',
+        value: claimedA,
+        expectedValue: open,
+        expirationTtl: 3600
+      }]),
+      1
+    );
+    assert.equal(
+      await applyOperationalStateChanges(env, [{
+        name: 'fwd_session:sqlite',
+        value: claimedB,
+        expectedValue: open,
+        expirationTtl: 3600
+      }]),
+      0
+    );
+    assert.equal(
+      await readOperationalState(env, 'fwd_session:sqlite'),
+      claimedA
+    );
+
+    assert.equal(
+      await acquireOperationalLease(
+        env,
+        'ui-panel:sqlite',
+        { leaseToken: 'owner-a', leaseSeconds: 60 }
+      ),
+      true
+    );
+    assert.equal(
+      await acquireOperationalLease(
+        env,
+        'ui-panel:sqlite',
+        { leaseToken: 'owner-b', leaseSeconds: 60 }
+      ),
+      false
+    );
+    assert.equal(
+      await releaseOperationalLease(
+        env,
+        'ui-panel:sqlite',
+        { leaseToken: 'owner-b' }
+      ),
+      false
+    );
+    assert.equal(
+      await releaseOperationalLease(
+        env,
+        'ui-panel:sqlite',
+        { leaseToken: 'owner-a' }
+      ),
+      true
+    );
+  } finally {
+    database.close();
+  }
+});

@@ -8,6 +8,9 @@ const MAX_UPDATE_LEASE_SECONDS = 60 * 60;
 const DEFAULT_OPERATIONAL_LEASE_SECONDS = 20 * 60;
 const MIN_OPERATIONAL_LEASE_SECONDS = 60;
 const MAX_OPERATIONAL_LEASE_SECONDS = 60 * 60;
+const MAX_OPERATIONAL_STATE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const MAX_OPERATIONAL_STATE_CHANGES = 12;
+const MAX_OPERATIONAL_STATE_VALUE_BYTES = 1_500_000;
 const DEFAULT_PROCESSED_UPDATE_RETENTION_DAYS = 7;
 const DEFAULT_SENT_DELIVERY_RETENTION_DAYS = 7;
 const DEFAULT_DEAD_DELIVERY_RETENTION_DAYS = 30;
@@ -160,15 +163,34 @@ export async function copySubscriptions(
     }
   }
 
-  const statements = Array.from(unique.values(), (subscription) =>
-    bindSubscriptionInsert(database, subscription)
-  );
-  if (statements.length === 0) {
+  if (unique.size === 0) {
     return 0;
   }
 
-  const results = await database.batch(statements);
-  return results.reduce((total, result) => total + getChanges(result), 0);
+  const payload = JSON.stringify(Array.from(unique.values()));
+  const result = await database
+    .prepare(`
+      INSERT INTO subscriptions (
+        type,
+        channel_name,
+        rss_url,
+        chat_id,
+        thread_id
+      )
+      SELECT
+        json_extract(value, '$.type'),
+        json_extract(value, '$.channelName'),
+        json_extract(value, '$.rssUrl'),
+        json_extract(value, '$.chatId'),
+        json_extract(value, '$.threadId')
+      FROM json_each(?)
+      WHERE 1
+      ON CONFLICT(rss_url, chat_id, thread_id) DO NOTHING
+    `)
+    .bind(payload)
+    .run();
+
+  return getChanges(result);
 }
 
 /**
@@ -661,6 +683,29 @@ export async function acquireOperationalLease(env, name, options = {}) {
   return getChanges(result) > 0;
 }
 
+export async function renewOperationalLease(env, name, options = {}) {
+  const database = getDatabase(env);
+  const normalizedName = normalizeRequiredText(name, 'lease name');
+  if (normalizedName.length > 100) {
+    throw new TypeError('lease name must be at most 100 characters');
+  }
+  const { leaseSeconds, leaseToken } = normalizeOperationalLeaseOptions(options);
+  const result = await database
+    .prepare(`
+      UPDATE operational_leases
+      SET
+        lease_expires_at = unixepoch() + ?,
+        updated_at = unixepoch()
+      WHERE name = ?
+        AND lease_token = ?
+        AND lease_expires_at > unixepoch()
+    `)
+    .bind(leaseSeconds, normalizedName, leaseToken)
+    .run();
+
+  return getChanges(result) > 0;
+}
+
 export async function releaseOperationalLease(env, name, options = {}) {
   const database = getDatabase(env);
   const normalizedName = normalizeRequiredText(name, 'lease name');
@@ -681,6 +726,116 @@ export async function releaseOperationalLease(env, name, options = {}) {
     .run();
 
   return getChanges(result) > 0;
+}
+
+/**
+ * Read short-lived interaction state from D1's primary so callbacks never rely
+ * on eventually-consistent KV propagation for authorization or fencing.
+ */
+export async function readOperationalState(env, name) {
+  const database = getPrimaryDatabase(env);
+  const normalizedName = normalizeOperationalStateName(name);
+  const row = await database
+    .prepare(`
+      SELECT lease_token AS value
+      FROM operational_leases
+      WHERE name = ?
+        AND lease_expires_at > unixepoch()
+      LIMIT 1
+    `)
+    .bind(normalizedName)
+    .first();
+
+  return row?.value === null || row?.value === undefined
+    ? null
+    : String(row.value);
+}
+
+/**
+ * Apply a small set of interaction-state mutations atomically. A change may
+ * put a value, conditionally replace one value, or delete a value. The shared
+ * operational_leases table provides expiry without requiring another schema.
+ */
+export async function applyOperationalStateChanges(env, changes) {
+  if (
+    !Array.isArray(changes) ||
+    changes.length === 0 ||
+    changes.length > MAX_OPERATIONAL_STATE_CHANGES
+  ) {
+    throw new TypeError(
+      `state changes must contain 1-${MAX_OPERATIONAL_STATE_CHANGES} entries`
+    );
+  }
+
+  const database = getDatabase(env);
+  const statements = changes.map((change, index) => {
+    if (!change || typeof change !== 'object' || Array.isArray(change)) {
+      throw new TypeError(`state change ${index} must be an object`);
+    }
+    const name = normalizeOperationalStateName(change.name);
+    if (change.delete === true) {
+      if (change.expectedValue === null || change.expectedValue === undefined) {
+        return database
+          .prepare('DELETE FROM operational_leases WHERE name = ?')
+          .bind(name);
+      }
+      const expectedValue = normalizeOperationalStateValue(
+        change.expectedValue,
+        `state change ${index} expectedValue`
+      );
+      return database
+        .prepare(`
+          DELETE FROM operational_leases
+          WHERE name = ? AND lease_token = ?
+        `)
+        .bind(name, expectedValue);
+    }
+
+    const value = normalizeOperationalStateValue(
+      change.value,
+      `state change ${index} value`
+    );
+    const expirationTtl = normalizeOperationalStateTtl(
+      change.expirationTtl,
+      `state change ${index} expirationTtl`
+    );
+    if (change.expectedValue !== null && change.expectedValue !== undefined) {
+      const expectedValue = normalizeOperationalStateValue(
+        change.expectedValue,
+        `state change ${index} expectedValue`
+      );
+      return database
+        .prepare(`
+          UPDATE operational_leases
+          SET
+            lease_token = ?,
+            lease_expires_at = unixepoch() + ?,
+            updated_at = unixepoch()
+          WHERE name = ?
+            AND lease_token = ?
+            AND lease_expires_at > unixepoch()
+        `)
+        .bind(value, expirationTtl, name, expectedValue);
+    }
+
+    return database
+      .prepare(`
+        INSERT INTO operational_leases (
+          name,
+          lease_token,
+          lease_expires_at,
+          updated_at
+        )
+        VALUES (?, ?, unixepoch() + ?, unixepoch())
+        ON CONFLICT(name) DO UPDATE SET
+          lease_token = excluded.lease_token,
+          lease_expires_at = excluded.lease_expires_at,
+          updated_at = excluded.updated_at
+      `)
+      .bind(name, value, expirationTtl);
+  });
+  const results = await database.batch(statements);
+  return results.reduce((total, result) => total + getChanges(result), 0);
 }
 
 export async function pruneOperationalState(env, options = {}) {
@@ -733,20 +888,26 @@ export async function pruneOperationalState(env, options = {}) {
         WHERE status = 'dead'
           AND updated_at < unixepoch() - ?
       `)
-      .bind(deadDeliveryAge)
+      .bind(deadDeliveryAge),
+    database.prepare(`
+      DELETE FROM operational_leases
+      WHERE lease_expires_at <= unixepoch()
+    `)
   ]);
 
   const summary = {
     processedUpdates: getChanges(results[0]),
     sentDeliveries: getChanges(results[1]),
-    deadDeliveries: getChanges(results[2])
+    deadDeliveries: getChanges(results[2]),
+    operationalLeases: getChanges(results[3])
   };
   return {
     ...summary,
     total:
       summary.processedUpdates +
       summary.sentDeliveries +
-      summary.deadDeliveries
+      summary.deadDeliveries +
+      summary.operationalLeases
   };
 }
 
@@ -1321,6 +1482,41 @@ function normalizeOperationalLeaseOptions(options) {
   return { leaseSeconds, leaseToken };
 }
 
+function normalizeOperationalStateName(value) {
+  const name = normalizeRequiredText(value, 'state name');
+  if (name.length > 100) {
+    throw new TypeError('state name must be at most 100 characters');
+  }
+  return name;
+}
+
+function normalizeOperationalStateValue(value, label) {
+  const normalized = normalizeRequiredText(value, label);
+  if (
+    new TextEncoder().encode(normalized).length >
+    MAX_OPERATIONAL_STATE_VALUE_BYTES
+  ) {
+    throw new TypeError(
+      `${label} must be at most ${MAX_OPERATIONAL_STATE_VALUE_BYTES} bytes`
+    );
+  }
+  return normalized;
+}
+
+function normalizeOperationalStateTtl(value, label) {
+  const parsed = Number(value);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < MIN_OPERATIONAL_LEASE_SECONDS ||
+    parsed > MAX_OPERATIONAL_STATE_TTL_SECONDS
+  ) {
+    throw new TypeError(
+      `${label} must be an integer between ${MIN_OPERATIONAL_LEASE_SECONDS} and ${MAX_OPERATIONAL_STATE_TTL_SECONDS}`
+    );
+  }
+  return parsed;
+}
+
 function normalizeRetentionDays(value, fallback, label) {
   const parsed = Number(value ?? fallback);
   if (
@@ -1364,6 +1560,13 @@ function getDatabase(env) {
     throw new TypeError('env.SQL D1 binding is required');
   }
   return env.SQL;
+}
+
+function getPrimaryDatabase(env) {
+  const database = getDatabase(env);
+  return typeof database.withSession === 'function'
+    ? database.withSession('first-primary')
+    : database;
 }
 
 function getLegacyKv(env) {

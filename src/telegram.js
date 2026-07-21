@@ -102,6 +102,56 @@ export async function sendTelegramMessage(
   return callTelegramApi(token, 'sendMessage', payload, options);
 }
 
+/** Edit one bot-owned message while preserving Telegram HTML rendering. */
+export async function editTelegramMessage(
+  token,
+  chatId,
+  messageId,
+  text,
+  replyMarkup = null,
+  options = {}
+) {
+  const message = String(text ?? '');
+  if (!message) {
+    return localFailure('Telegram message text is required');
+  }
+  if (message.length > MAX_MESSAGE_LENGTH) {
+    return localFailure(`Telegram message exceeds ${MAX_MESSAGE_LENGTH} characters`);
+  }
+  const normalizedMessageId = parsePositiveSafeInteger(messageId);
+  if (normalizedMessageId === null) {
+    return localFailure('message_id must be a positive safe integer');
+  }
+
+  const payload = {
+    chat_id: chatId,
+    message_id: normalizedMessageId,
+    text: message,
+    parse_mode: 'HTML'
+  };
+  if (replyMarkup !== null && replyMarkup !== undefined) {
+    payload.reply_markup = replyMarkup;
+  }
+  return callTelegramApi(token, 'editMessageText', payload, options);
+}
+
+/** Best-effort callers can use this result without hiding transport failures. */
+export async function deleteTelegramMessage(
+  token,
+  chatId,
+  messageId,
+  options = {}
+) {
+  const normalizedMessageId = parsePositiveSafeInteger(messageId);
+  if (normalizedMessageId === null) {
+    return localFailure('message_id must be a positive safe integer');
+  }
+  return callTelegramApi(token, 'deleteMessage', {
+    chat_id: chatId,
+    message_id: normalizedMessageId
+  }, options);
+}
+
 export async function answerCallbackQuery(token, callbackQueryId, text, options = {}) {
   const payload = {
     callback_query_id: callbackQueryId,
@@ -383,6 +433,11 @@ async function callTelegramApi(token, method, payload, { fetchFn = globalThis.fe
     const retryAfterSeconds = extractRetryAfterSeconds(body, response);
     const retryable = isRetryableStatus(upstreamStatus);
     const description = `Telegram HTTP ${upstreamStatus}`;
+    const apiDescription = sanitizeTelegramLogValue(
+      body?.description || '',
+      token,
+      sensitiveValues
+    );
     return {
       ok: false,
       status: upstreamStatus,
@@ -391,6 +446,7 @@ async function callTelegramApi(token, method, payload, { fetchFn = globalThis.fe
       retryAfterSeconds,
       error: description,
       result: null,
+      apiDescription: apiDescription || null,
       diagnostic: createTelegramDiagnostic({
         failureKind: 'http_error',
         failurePhase,
@@ -587,7 +643,13 @@ function normalizeTelegramDiagnostic(value, token, sensitiveValues) {
 
 function collectPayloadSensitiveValues(payload) {
   const values = [];
-  for (const key of ['text', 'chat_id', 'user_id', 'callback_query_id']) {
+  for (const key of [
+    'text',
+    'chat_id',
+    'message_id',
+    'user_id',
+    'callback_query_id'
+  ]) {
     if (payload?.[key] !== null && payload?.[key] !== undefined) {
       values.push(payload[key]);
     }
